@@ -2947,10 +2947,10 @@ export async function peekStreamFailure(stream, bounds = {}) {
   const verdict = { decided: false, failureCode: null };
   const decoder = new TextDecoder();
   const scanner = createSseLineScanner((/** @type {string} */ line) => {
-    if (verdict.decided || !line.startsWith('data: ')) return;
+    if (verdict.decided || !line.startsWith('data:')) return;
     /** @type {any} */
     let data;
-    try { data = JSON.parse(line.slice(6)); } catch { verdict.decided = true; return; }
+    try { data = JSON.parse(line.slice(5)); } catch { verdict.decided = true; return; }
     const type = typeof data?.type === 'string' ? data.type : '';
     if (SSE_UNCOMMITTED_EVENTS.has(type)) return;
     const code = type === 'response.failed' || type === 'error' ? streamFailureCode(data) : null;
@@ -4402,10 +4402,10 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
  */
 function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, onRefusal = null) {
-  if (!line.startsWith('data: ')) return;
+  if (!line.startsWith('data:')) return;
 
   try {
-    const data = JSON.parse(line.slice(6));
+    const data = JSON.parse(line.slice(5));
     const refusal = refusalFromSseEvent(data);
     if (refusal) onRefusal?.(refusal);
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
