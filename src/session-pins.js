@@ -26,6 +26,7 @@ export const MAX_SESSION_PINS = 1000;
  * @property {string} account   the account name the operator chose
  * @property {number} since     when the pin was set
  * @property {number} lastUsed  when it was set or last applied to a request
+ * @property {string|null} [client]  the client key the session belongs to (IPM fork, see bind)
  */
 
 export class SessionPins {
@@ -78,6 +79,31 @@ export class SessionPins {
   }
 
   /**
+   * Bind `sessionId`'s pin to the client key whose session it is (IPM fork,
+   * client-routes.js). Session ids are client-chosen headers, so with client
+   * routes in force a pin applies only to requests from this same key, and
+   * another key presenting the id gets its own route. Null binds it to the
+   * operator (the shared key or key-less loopback). No-op without a pin.
+   * @param {string} sessionId
+   * @param {string|null} client
+   */
+  bind(sessionId, client) {
+    const pin = this.pins.get(sessionId);
+    if (pin) pin.client = client || null;
+  }
+
+  /**
+   * The whole pin for `sessionId` (account and bound client), or null. A hit
+   * counts as use, as in get().
+   * @param {string|null} sessionId
+   * @returns {SessionPin|null}
+   */
+  entry(sessionId, now = this._now()) {
+    if (!sessionId || this.get(sessionId, now) == null) return null;
+    return this.pins.get(sessionId) ?? null;
+  }
+
+  /**
    * Follow an account rename, so a pin keeps naming the account it was set on.
    * @param {string} from
    * @param {string} to
@@ -105,6 +131,7 @@ export class SessionPins {
       session: id.slice(0, 8),
       ...(detail ? { id } : {}),
       account: pin.account,
+      ...(pin.client !== undefined ? { client: pin.client } : {}),
       since: pin.since,
       lastUsed: pin.lastUsed,
     }));

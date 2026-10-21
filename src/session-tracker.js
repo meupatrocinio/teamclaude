@@ -738,6 +738,22 @@ export class SessionTracker {
     return false;
   }
 
+  // The client keys seen on a client session within the known window (IPM
+  // fork: an operator session pin is bound to one of them, session-pins.js).
+  // A scan, for the control plane only, like knowsSession.
+  /** @param {string|null} sessionId @returns {Set<string>} */
+  clientsOf(sessionId, now = this._now()) {
+    const out = new Set();
+    if (!sessionId) return out;
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id !== sessionId && s.sessionId !== sessionId) continue;
+      if (s.client) out.add(s.client);
+      for (const c of s.clientsSeen || []) out.add(c);
+    }
+    return out;
+  }
+
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
     this._pruneRouted(now);
@@ -870,7 +886,13 @@ function sessionItem(id, s, active) {
 // existing label alone, so a request without the header does not erase it.
 function applyMetadata(s, metadata) {
   if (!metadata || typeof metadata !== 'object') return;
-  if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  if (typeof metadata.client === 'string' && metadata.client) {
+    s.client = metadata.client;
+    // Every key seen on the record, not just the last (IPM fork): an operator
+    // session pin is bound to one key, and a session id two keys have sent
+    // must not be bound to whichever spoke last (see clientsOf).
+    (s.clientsSeen ??= new Set()).add(metadata.client);
+  }
   if (typeof metadata.sessionId === 'string' && metadata.sessionId) s.sessionId = metadata.sessionId;
   if (typeof metadata.conversation === 'string' && metadata.conversation) s.conversation = metadata.conversation;
   const dims = metadata.dimensions;

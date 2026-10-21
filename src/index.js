@@ -382,7 +382,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, clientRoutes: config.clientRoutes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -574,7 +574,15 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // IPM fork (client-routes.js): the fixed-seat switch, read per request.
+      config.proxy.requireClientRoute = diskConfig.proxy.requireClientRoute === true;
     }
+    // And the client routes it gates, in the same synchronous stretch as the
+    // keys and the switch: no await runs between these assignments, so every
+    // request reads the old policy or the new one, never half of each. A
+    // request keeps the binding it read at admission for all its retries.
+    config.clientRoutes = diskConfig.clientRoutes;
+    accountManager.setClientRoutes(config.clientRoutes);
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on
     // purpose: an operator who deletes the whole `proxy` section has asked for
@@ -811,7 +819,9 @@ async function serverCommand() {
       const model = label ? ` (${label})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
-      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      // A client-route outcome (IPM fork) takes the tag slot, so the line keeps
+      // one bracketed tag: [no-seat], [spent], [admin-pin] and the rest.
+      const pin = info.gate ? ` [${safeLine(info.gate, 32)}]` : (info.pinned || r?.pinned) ? ' [pin]' : '';
       writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well

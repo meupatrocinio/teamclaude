@@ -6,6 +6,7 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
+import { parseClientRoutes, clearSeatRejection } from './client-routes.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
@@ -546,6 +547,7 @@ export class AccountManager {
    * @param {number} [opts.statusStaleMs]
    * @param {number} [opts.forcedRefreshFloorMs]
    * @param {Array<Object>} [opts.routes]
+   * @param {Array<Object>} [opts.clientRoutes]  client routes (IPM fork, client-routes.js)
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
    * @param {Object} [opts.adaptive]
@@ -554,7 +556,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, clientRoutes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -635,6 +637,8 @@ export class AccountManager {
     this._advisorNarrowing = null;
     this._advisorNarrowLogAt = 0;
     this.setRoutes(routes);
+    // Client routes (IPM fork): see client-routes.js. Not model routes.
+    this.setClientRoutes(clientRoutes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
     // takes a reading.
@@ -2878,6 +2882,20 @@ export class AccountManager {
   }
 
   /**
+   * Client routes (IPM fork, client-routes.js): which client keys each fixed
+   * seat serves. Stored as account NAMES and resolved per request by the
+   * server, because a reload can renumber accounts. Kept apart from the model
+   * routes above: `this.routes`, getRoutes() and everything that edits them
+   * never see these. Called from the constructor and on config reload; the
+   * parse warnings are logged here, once per load.
+   * @param {unknown} clientRoutes
+   */
+  setClientRoutes(clientRoutes) {
+    this.clientRoutes = parseClientRoutes(clientRoutes);
+    for (const w of this.clientRoutes.warnings) console.log(`[TeamClaude] ${w}`);
+  }
+
+  /**
    * Cursor key for a request: its route's name, or — with no route configured —
    * the weekly bucket the model spends, so Fable and Opus keep separate cursors
    * in the default config too (one key for everything let a Fable diversion be
@@ -4956,7 +4974,10 @@ export class AccountManager {
    */
   clearUpstreamRejected(accountIndex) {
     const account = this.accounts[accountIndex];
-    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    if (!account) return;
+    // The spent reading a fixed seat answers from (IPM fork) goes with it.
+    clearSeatRejection(account);
+    if (account.quota.unifiedStatus !== 'rejected') return;
     account.quota.unifiedStatus = null;
     account.quota.unifiedStatusSeenAt = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" upstream rejection cleared — it no longer applies`);
