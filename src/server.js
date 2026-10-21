@@ -4222,6 +4222,7 @@ export function readWithIdleTimeout(reader, ms) {
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the stream reports
  */
 export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, onRefusal = null) {
   const reader = webStream.getReader();
@@ -4400,6 +4401,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the line reports
  */
 function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, onRefusal = null) {
   if (!line.startsWith('data:')) return;
@@ -4445,6 +4447,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {string|null} [pinKey]
  * @param {string|null} [model]
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the body reports
  */
 function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onRefusal = null) {
   try {
