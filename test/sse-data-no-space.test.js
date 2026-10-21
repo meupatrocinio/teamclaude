@@ -49,7 +49,7 @@ test('usage on `data:` lines with no space is booked per client and per account'
 
 /** @param {string} text */
 const streamOf = (text) => new ReadableStream({
-  start(c) { c.enqueue(new TextEncoder().encode(text)); c.close(); },
+  start(c) { c.enqueue(new Uint8Array(Buffer.from(text))); c.close(); },
 });
 
 test('the stream-failure peek reads a failure on a `data:` line with no space', async () => {

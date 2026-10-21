@@ -4396,7 +4396,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {string} line
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
@@ -4411,7 +4411,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      onUsage?.(data.message.usage.input_tokens || 0, 0);
+      onUsage?.(data.message.usage.input_tokens || 0, 0, data.message.usage.cache_read_input_tokens || 0, data.message.usage.cache_creation_input_tokens || 0);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
@@ -4428,7 +4428,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       if (usage) {
         if (responsesTurn) responsesTurn.settled = true;
         accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-        onUsage?.(usage.input_tokens, usage.output_tokens);
+        onUsage?.(usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens || 0, 0);
         if (merged) Object.assign(merged, usage);
       }
     }
@@ -4441,7 +4441,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {Buffer} buffer
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} [onUsage]
  * @param {string|null} [pinKey]
  * @param {string|null} [model]
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
@@ -4463,7 +4463,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0, usage.cache_read_input_tokens || 0, usage.cache_creation_input_tokens || 0);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
     }
   } catch {
