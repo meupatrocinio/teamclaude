@@ -3672,7 +3672,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      // Never for a pinned request: a pin names exactly one account, and the
+      // hop's ctx.hopTo would otherwise send it to a sibling nobody chose.
+      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -3833,7 +3835,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // A pinned request takes no hop, as on the 429 path: its 5xx is the pinned
+    // account's own answer and goes to the client.
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -3945,7 +3949,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // way is the provider talking, not the account — keyed on the first
     // decisive event instead of the status. The sibling is picked first so a
     // request with nowhere to hop to is never held for nothing.
-    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    // Not for a pinned request, for the same reason as the two hops above.
+    if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
