@@ -39,6 +39,18 @@ A request keeps the binding it read at admission for all its retries.
 Client routes are separate from the model routes (`routes`). `teamclaude route`, the TUI, the MCP
 tools and `getRoutes()` never see them.
 
+## End-user identity upstream
+
+Every Anthropic-path request that carries a client key is stamped with a stable per-user tag in
+`metadata.user_id` (`gateway_user: "u_<sha256 of the key name, 16 hex>"`), on any pool — routes or
+not. The key name is hashed because user_id must not carry PII, and the name — not the key — is
+what survives a re-mint. Claude Code's own `device_id`, session id and `account_uuid` pass through
+untouched, so upstream attributes per person and per machine rather than per seat; Anthropic's
+abuse-detection guidance asks multi-user services for exactly this. Requests with no client key
+(the shared admin key, key-less loopback) go unstamped, and a body whose metadata cannot be read
+cleanly is sent as-is — a request is never broken to stamp it. Codex requests carry no
+`metadata.user_id` and are not stamped.
+
 ## What a request gets
 
 The gate runs for every Anthropic request once any route exists or the switch is on. The same rules
