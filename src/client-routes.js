@@ -325,6 +325,27 @@ export function combineVerdicts(verdicts) {
 const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
 
 /**
+ * The next account in a seat's queue that can serve now, in config order,
+ * skipping the conversation's pinned (spent) one — the account a fresh,
+ * handoff-ed conversation would land on. Queue order, not least-loaded: the
+ * seat's quota drains one account at a time, and an earlier account whose
+ * window has since reset is servable again and correctly found first.
+ * @param {any} accountManager
+ * @param {number[]} indices  the seat's accounts, in config order
+ * @param {number} currentIdx  the pinned account the answer is about
+ * @param {string|null} [model]
+ * @returns {string|null} the account's name, or null when nothing else serves
+ */
+export function nextInSeatQueue(accountManager, indices, currentIdx, model = null) {
+  for (const i of indices) {
+    if (i === currentIdx) continue;
+    const account = accountManager.accounts[i];
+    if (account && !seatVerdict(accountManager, account, model, null)) return account.name;
+  }
+  return null;
+}
+
+/**
  * The HTTP answer for a gate refusal or a bound seat that cannot serve.
  * Shaped for Claude Code: a 403 is a permission refusal; a 429 carrying
  * upstream's unified headers plus `x-should-retry: false` reads as a plan
@@ -332,10 +353,13 @@ const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
  * retries; a 503 with `x-should-retry: false` stops at once.
  *
  * @param {string} reason  one of SEAT_REASONS
- * @param {{ seat?: string|null, verdict?: SeatVerdict|null, detail?: string|null }} [info]
+ * @param {{ seat?: string|null, verdict?: SeatVerdict|null, detail?: string|null, queue?: { pinned: string, next: string|null }|null }} [info]
+ *   queue is set only for a conversation pinned inside a multi-account seat
+ *   whose pinned account is spent: pinned names that account, next the seat
+ *   queue's next servable account (null when none serves).
  * @returns {{ status: number, headers: Record<string, string>, body: string }}
  */
-export function seatAnswer(reason, { seat = null, verdict = null, detail = null } = {}) {
+export function seatAnswer(reason, { seat = null, verdict = null, detail = null, queue = null } = {}) {
   const shown = seat ? `"${safeLine(seat, 64)}"` : '';
   const json = { 'Content-Type': 'application/json' };
   const err = (/** @type {string} */ type, /** @type {string} */ message) => JSON.stringify({ type: 'error', error: { type, message } });
@@ -349,10 +373,18 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null 
     case SEAT_REASONS.spent: {
       const rej = verdict?.kind === 'spent' ? verdict.rejection : null;
       const when = rej ? new Date(rej.resetsAt).toISOString() : null;
+      // A conversation pinned inside a multi-account seat is told the queue:
+      // the next account would serve, at one full-price cold-cache turn, and
+      // a handoff is the cheaper way to get there.
+      const queueHint = queue
+        ? queue.next
+          ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", one of this seat's accounts. "${safeLine(queue.next, 64)}" is next in the seat's queue and has quota, but continuing there re-processes this whole conversation once at full price (cold prompt cache). Recommended instead: run /ipm:handoff, then start a fresh session — it lands on "${safeLine(queue.next, 64)}" with a compact summary.`
+          : ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`
+        : '';
       return {
         status: 429,
         headers: { ...json, ...(rej?.headers || {}), 'x-should-retry': 'false' },
-        body: err('rate_limit_error', `Your Claude seat${shown ? ` ${shown}` : ''} is out of quota${when ? ` until ${when}` : ''}. ${KIMI_HINT}`),
+        body: err('rate_limit_error', `Your Claude seat${shown ? ` ${shown}` : ''} is out of quota${when ? ` until ${when}` : ''}.${queueHint} ${KIMI_HINT}`),
       };
     }
     case SEAT_REASONS.throttled: {

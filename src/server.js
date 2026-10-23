@@ -11,10 +11,10 @@ import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-cont
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
-import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat } from './client-routes.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
+import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
@@ -3190,15 +3190,24 @@ function logSeatEvent(client, seat, reason, status, detail = null) {
 /**
  * Answer a bound request whose seat cannot serve it (IPM fork). Never another
  * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
+ * When the request was pinned to one account of a multi-account seat
+ * (ctx.boundPinned) and that account is spent, the answer names the next
+ * servable account in the seat's queue, so the user can hand off to a fresh
+ * session there instead of dragging the whole conversation onto a cold cache.
  * @param {any} res
  * @param {Record<string, any>} ctx
  * @param {import('./client-routes.js').SeatVerdict} verdict
  * @param {string} shownAccount
+ * @param {any} [accountManager]  with accountIndex, needed for the queue hint
+ * @param {number|null} [accountIndex]  the verdict's account, for the queue hint
  */
-function respondSeat(res, ctx, verdict, shownAccount) {
+function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, accountIndex = null) {
   const reason = verdictReason(verdict);
   const detail = verdict.kind === 'unavailable' ? verdict.reason : null;
-  const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail });
+  const queue = accountManager && accountIndex != null && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
+    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model) }
+    : null;
+  const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue });
   ctx.status = answer.status;
   ctx.account = shownAccount;
   ctx.gate = reason;
@@ -3212,19 +3221,30 @@ function respondSeat(res, ctx, verdict, shownAccount) {
 }
 
 /**
- * The account a request bound to a multi-account seat goes to next (IPM fork):
- * the seat's best by the pure picker (pickAlternate, which never moves the
- * fleet cursor), else any seat account that can serve. Null when the seat has
- * nothing left, which the no-account branch answers from the seat's state.
+ * The account a request bound to a multi-account seat goes to next (IPM fork).
+ * The seat's accounts are a drain queue in config order. A conversation pinned
+ * to one of them stays on it (ctx.boundPinned): its verdict — spent,
+ * throttled, unavailable — is the request's own answer, never a silent move
+ * onto a sibling, which would re-process the whole conversation there with a
+ * cold cache. A conversation with no pin in the seat — a fresh one, e.g.
+ * after a handoff — takes the first servable account in queue order, so the
+ * seat's quota drains one account at a time instead of spreading across all
+ * of them at once. Null when the seat has nothing left, which the no-account
+ * branch answers from the seat's state.
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
  */
 function pickBoundAccount(accountManager, ctx) {
   const left = ctx.bound.indices.filter((/** @type {number} */ i) => !ctx.tried.has(i) && !ctx.rolledOff?.has(i));
   if (!left.length) return null;
-  const exclude = new Set([...ctx.tried, ...(ctx.boundExclude || [])]);
-  const best = accountManager.pickAlternate(exclude, ctx.model, ctx.advisorModel, ctx.provider);
-  if (best && left.includes(best.index)) return best;
+  const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+  const pinIdx = ctx.pinKey ? accountManager.sessionTracker.pinnedAccount(ctx.pinKey, bucket) : null;
+  if (pinIdx != null && left.includes(pinIdx)) {
+    ctx.boundPinned = true;
+    return accountManager.accounts[pinIdx] ?? null;
+  }
+  // An unpinned pick, and a verdict retry must be free to advance the queue.
+  ctx.boundPinned = false;
   const servable = left.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
   return accountManager.accounts[servable ?? left[0]] ?? null;
 }
@@ -3519,11 +3539,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (ctx.bound) {
     const verdict = seatVerdict(accountManager, account, ctx.model, ctx.advisorModel);
     if (verdict) {
-      if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+      // A pick made from the conversation's pin inside the seat keeps the
+      // pinned account's verdict as the answer (boundPinned): re-selecting
+      // onto a sibling account of the seat would move the whole conversation
+      // to a cold cache with no warning. Only an unpinned pick — a fresh
+      // conversation, which the queue order then advances — re-selects.
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
         ctx.tried.add(account.index);
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
-      return respondSeat(res, ctx, verdict, account.name);
+      return respondSeat(res, ctx, verdict, account.name, accountManager, account.index);
     }
   }
 
@@ -3757,12 +3782,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : null;
     if (seatRejection && ctx.bound) {
       await upstreamRes.body?.cancel();
-      if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+      // A pin inside the seat keeps the hard stop (with the queue hint) rather
+      // than re-selecting onto a sibling — same rule as the pre-send verdict.
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
         ctx.tried.add(account.index);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
-      return respondSeat(res, ctx, { kind: 'spent', rejection: seatRejection }, account.name);
+      return respondSeat(res, ctx, { kind: 'spent', rejection: seatRejection }, account.name, accountManager, account.index);
     }
 
     // Any response at all came back through the account's routing proxy.

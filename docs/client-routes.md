@@ -25,7 +25,13 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
 - A client listed on two routes is **ambiguous**. Neither route applies, and the key gets
   "seat unavailable".
 - A route with several accounts is allowed. Its requests stay inside those accounts, and failover
-  hops move only between them.
+  hops move only between them. The account list is a **drain queue in config order**: a
+  conversation pins to the first account it starts on and stays there until that account cannot
+  serve; a spent pinned account is a hard stop that names the queue's next account and recommends
+  a handoff to a fresh session (continuing mid-conversation would re-process the whole transcript
+  on a cold cache). Only a fresh conversation — one with no pin, as after a handoff — takes the
+  next servable account, so the seat's quota drains one account at a time instead of spreading
+  across all of them at once.
 
 `POST /teamclaude/reload` applies both keys with no restart, in the same step as `proxy.clientKeys`.
 A request keeps the binding it read at admission for all its retries.
