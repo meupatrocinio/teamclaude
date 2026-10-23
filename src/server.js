@@ -11,7 +11,6 @@ import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-cont
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
-import { stampGatewayUser } from './user-identity.js';
 import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
@@ -3659,14 +3658,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
-  // End-user identity (IPM fork, user-identity.js): a request carrying a client
-  // key is stamped with the stable hashed user tag in metadata.user_id, so
-  // upstream attributes abuse per person rather than per seat. Anthropic-path
-  // requests only — a Codex body has no metadata.user_id. Admin-key and
-  // key-less loopback requests carry no client and go unstamped.
-  if (ctx.client && ctx.provider === DEFAULT_PROVIDER) {
-    sendBody = stampGatewayUser(sendBody, ctx.client);
-  }
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
