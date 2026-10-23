@@ -233,3 +233,42 @@ test('a wrong span can no longer corrupt: the validation net returns the origina
   const out = stampGatewayUser(weird, 'ana');
   assert.equal(out.toString(), weird.toString());
 });
+
+test('fuzz: random nested bodies never gain stray metadata and always parse after stamping', () => {
+  let seed = 42;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const gen = (depth) => {
+    if (depth > 4) return pick([1, 's', null, true]);
+    const kind = rnd();
+    if (kind < 0.35) {
+      const n = Math.floor(rnd() * 4);
+      return Array.from({ length: n }, () => gen(depth + 1));
+    }
+    if (kind < 0.7) {
+      const out = {};
+      const n = Math.floor(rnd() * 4);
+      for (let i = 0; i < n; i++) out[pick(['model', 'metadata', 'user_id', 'messages', 'system', 'text', 'k' + i])] = gen(depth + 1);
+      return out;
+    }
+    return pick(['has } braces { and "quotes" \\ and \\', 42, null, true, 'plain', '"user_id":"{" }']);
+  };
+  for (let round = 0; round < 300; round++) {
+    const doc = { model: 'm', messages: gen(0), system: gen(0), tools: gen(0), ...(rnd() < 0.5 ? { metadata: gen(0) } : {}) };
+    const text = JSON.stringify(doc);
+    const stamped = stampGatewayUser(Buffer.from(text), 'ana');
+    const parsed = JSON.parse(stamped.toString()); // must parse
+    // metadata below the top level only if the ORIGINAL had it there.
+    const strayBelow = (v, orig, path) => {
+      if (Array.isArray(v)) v.forEach((x, i) => strayBelow(x, orig?.[i], `${path}.${i}`));
+      else if (v && typeof v === 'object') for (const k of Object.keys(v)) {
+        if (k === 'metadata' && path !== '$') {
+          const hadIt = orig && typeof orig === 'object' && 'metadata' in orig;
+          assert.ok(hadIt, `round ${round}: stamped doc gained metadata at ${path}`);
+        }
+        strayBelow(v[k], orig?.[k], `${path}.${k}`);
+      }
+    };
+    strayBelow(parsed, doc, '$');
+  }
+});
