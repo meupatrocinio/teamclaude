@@ -272,3 +272,36 @@ test('fuzz: random nested bodies never gain stray metadata and always parse afte
     strayBelow(parsed, doc, '$');
   }
 });
+
+test('count_tokens is never stamped: Anthropic rejects metadata there and Claude Code sends none', async () => {
+  const received = [];
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    received.push({ path: req.url, body: raw });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(req.url.includes('count_tokens')
+      ? { input_tokens: 42 }
+      : { id: 'msg_1', type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upPort = await listen(upstream);
+  const acct = { name: 'sa', type: 'oauth', accessToken: 't-sa', refreshToken: 'r', expiresAt: Date.now() + HOUR };
+  const am = new AccountManager([acct], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'admin', clientKeys: [{ name: 'ana', key: 'ana-key' }] },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens?beta=true`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'ana-key' },
+      body: JSON.stringify({ model: 'claude-opus-4-1', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(received.length, 1);
+    assert.ok(!('metadata' in JSON.parse(received[0].body)), 'count_tokens gained a metadata field');
+  } finally {
+    proxy.closeAllConnections?.(); proxy.close();
+    upstream.closeAllConnections?.(); upstream.close();
+  }
+});
