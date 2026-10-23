@@ -36,6 +36,12 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+## A 400 on a third-party upstream
+
+A `400` from a first-party Anthropic upstream is about the request: every account refuses it identically, so the response is relayed and no sibling is spent re-proving it. An account with its own `upstream` breaks that premise — third-party Anthropic-compatible backends (Kimi, GLM, OpenCode Zen) each reject shapes the others accept (`context_management`, some `cache_control` subfields), and per-account API versions drift. So a custom-upstream account's 400 takes **one** failover hop to a sibling, on the same budget and for the same reason as the 5xx hop: if the sibling refuses too, the request itself is the problem and the answer goes to the client. Because the pin that keeps a conversation on its account is re-recorded per attempt, a session rescued by the hop stays on the account that served it instead of paying the refusing one again on every later turn. A pinned request keeps its account's own answer, as on the 429/5xx paths; a request bound to a seat by client routes hops only inside the seat.
+
+Every relayed upstream error — the second 400 after the hop, a pinned account's 400, a first-party one — is also logged with the reason, which lives in the body and used to be invisible: `Upstream 400 on "name" — invalid_request_error: <upstream's message>`, one bounded line per relayed error.
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.

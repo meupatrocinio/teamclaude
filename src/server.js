@@ -10,6 +10,7 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
+import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
@@ -4179,6 +4180,43 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
+    // A 400 from a first-party Anthropic upstream is about the request: every
+    // account refuses it identically, so it is relayed and no sibling is spent
+    // on proving that. An account with its own `upstream` breaks the premise —
+    // third-party Anthropic-compatible backends (Kimi, GLM, OpenCode Zen) each
+    // reject shapes the others accept (`context_management`, cache_control
+    // subfields; see rewriteRequestBody), and per-account API versions drift.
+    // Measured on the IPM kimi pool: ten consecutive 400s for one session on
+    // one account while a sibling served it — session affinity then re-sent
+    // every client retry to the refusing account, wedging the session.
+    // One hop, on the 5xx hop's budget and for the same reason: if the sibling
+    // also 400s, the request itself is the problem and its answer is relayed.
+    // The hop re-pins the session on the account that served it (recordSession
+    // runs per attempt), so the wedge does not re-form on the next turn. A
+    // pinned request keeps its account's own answer, as on the 429/5xx paths;
+    // a bound one hops only inside its seat (boundExclude).
+    if (ctx.pinnedIndex == null && upstreamRes.status === 400 && account.upstream
+        && !res.headersSent && !ctx.clientErrorHopped && retryCount < maxRetries) {
+      // Same exclusion as the 429/5xx hops, and the same cursor-preserving pick.
+      const alt = accountManager.pickAlternate(
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        // Read the reason BEFORE the cancel: the hop line carries it, and the
+        // refusing account's log would otherwise record a bare status.
+        const errorBody = await readErrorBody(upstreamRes.body).catch(() => null);
+        ctx.clientErrorHopped = true;
+        ctx.hopTo = alt.index;
+        ctx.tried.add(account.index);
+        const finding = upstreamErrorFromBody(errorBody);
+        const detail = finding?.type ? ` (${safeLine(finding.type, 64)}${finding.message ? `: ${safeLine(finding.message, 240)}` : ''})` : '';
+        console.log(`[TeamClaude] Upstream 400 on "${safeLine(account.name, 64)}"${detail} — failing over once to "${safeLine(alt.name, 64)}"`);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     // The ChatGPT backend answers a Codex Responses stream with no Content-Type
     // at all (issue #456). Keyed on the header alone, such a reply took the
     // buffered branch: the client saw nothing until the turn was over, and the
@@ -4301,6 +4339,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      // The error-body tap (upstream-error-tap.js): a relayed error's reason
+      // lives in the body, and the request log records only the status. One
+      // line per relayed error. The body is already fully buffered here, so
+      // the read costs nothing; an error that arrives as a stream is not
+      // tapped (it would hold the relay hostage mid-flight).
+      if (upstreamRes.status >= 400) {
+        reportUpstreamError(upstreamRes.status, account.name, upstreamErrorFromBody(buf));
+      }
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
