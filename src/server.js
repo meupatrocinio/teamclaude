@@ -3874,7 +3874,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
     // This refusal is about the request, even if it carries incidental quota
     // headers. Do not store those headers as an account-wide quota verdict.
-    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model, upstreamRes.status);
 
     // IPM fork (client-routes.js): a 429 that rejected a quota window is kept,
     // headers and all, so a request bound to this seat gets upstream's own
