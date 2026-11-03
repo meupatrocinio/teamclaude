@@ -157,6 +157,16 @@ function setAndReturn(map, key, value) {
  * @property {string|null} provider the fleet whose reading this is
  * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
+/**
+ * A disclosed, one-shot choice to continue a conversation on a sibling seat.
+ * The exact rejection is part of the scope: a later quota verdict is a new
+ * choice, not permission left over from this one.
+ *
+ * @typedef {Object} SeatContinuation
+ * @property {number} idx the rejected account's position in the account list
+ * @property {number} at when that rejection was recorded
+ * @property {number} resetsAt when its quota window resets
+ */
 export class SessionTracker {
   /**
    * @param {Object} [opts]
@@ -436,6 +446,9 @@ export class SessionTracker {
       this._makeRoom(now);
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        // client + route + bucket -> SeatContinuation. One disclosed choice per
+        // scope; a newer handoff response replaces the older one.
+        seatContinuations: new Map(),
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -518,6 +531,44 @@ export class SessionTracker {
   }
 
   /**
+   * Record that the client was told a fresh session is recommended, but that
+   * another prompt in this conversation confirms a cold-cache continuation.
+   * Never create a session here: a refusal for an unknown conversation has no
+   * pin against which a later request could safely consume the offer.
+   * @param {string|null} sessionId
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {number} [now]
+   */
+  recordSeatContinuation(sessionId, scope, now = this._now()) {
+    const s = sessionId && this._live(sessionId, now);
+    if (!s || !scope?.client || !scope.route || !scope.bucket
+        || !Number.isInteger(scope.idx) || !Number.isFinite(scope.at) || !Number.isFinite(scope.resetsAt)) return false;
+    const key = `${scope.client.trim().toLowerCase()}\0${scope.route}\0${scope.bucket}`;
+    s.seatContinuations.set(key, { idx: scope.idx, at: scope.at, resetsAt: scope.resetsAt });
+    return true;
+  }
+
+  /**
+   * Take is synchronous and one-shot, so two concurrent continuations cannot
+   * both spend the same disclosure. The caller supplies the live pin/rejection
+   * it validated; any mismatch consumes the stale offer and fails closed.
+   * @param {string|null} sessionId
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {number} [now]
+   */
+  takeSeatContinuation(sessionId, scope, now = this._now()) {
+    const s = sessionId && this._live(sessionId, now);
+    if (!s || !scope?.client || !scope.route || !scope.bucket) return null;
+    const key = `${scope.client.trim().toLowerCase()}\0${scope.route}\0${scope.bucket}`;
+    const offer = s.seatContinuations.get(key);
+    if (!offer) return null;
+    s.seatContinuations.delete(key);
+    if (offer.resetsAt <= now
+        || offer.idx !== scope.idx || offer.at !== scope.at || offer.resetsAt !== scope.resetsAt) return null;
+    return offer;
+  }
+
+  /**
    * The rollover observation this session holds for `bucket`: the account
    * traffic was last found resting on and what its windows read then. Kept
    * beside the pin rather than on it because it outlives a relocation — a pin
@@ -593,6 +644,11 @@ export class SessionTracker {
         const moved = mapFn(pin.idx);
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
+      }
+      for (const [key, offer] of [...s.seatContinuations]) {
+        const moved = mapFn(offer.idx);
+        if (moved == null) s.seatContinuations.delete(key);
+        else offer.idx = moved;
       }
       // An observation names its account by the same position, so it follows the
       // same shift. One naming the account that went away is dropped only if it

@@ -49,6 +49,46 @@ export const SEAT_REASONS = Object.freeze({
 });
 
 const norm = (/** @type {unknown} */ s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
+const SEAT_SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const SEAT_POLICY_MODES = new Set(['force', 'recommend']);
+
+/**
+ * Resolve the caller's per-seat choices against one renderer-produced route.
+ * Anything ambiguous disables force for the whole request; a partial map must
+ * never turn a malformed preference into permission to move a conversation.
+ *
+ * @param {unknown} rawHeader
+ * @param {ClientRoute} route
+ * @param {number[]} indices
+ * @returns {Map<number, 'force'|'recommend'>}
+ */
+export function parseSeatPolicies(rawHeader, route, indices) {
+  /** @type {Map<number, 'force'|'recommend'>} */
+  const empty = new Map();
+  const slugs = route.name.split('+');
+  if (slugs.length !== route.accounts.length || slugs.length !== indices.length
+      || new Set(slugs).size !== slugs.length || new Set(indices).size !== indices.length
+      || slugs.some(s => !SEAT_SLUG.test(s)) || indices.some(i => !Number.isInteger(i))) return empty;
+  if (typeof rawHeader !== 'string' || !rawHeader.trim()) return empty;
+  if (rawHeader.length > 4096) return empty;
+  const entries = rawHeader.split(',');
+  if (entries.length > 64) return empty;
+  /** @type {Map<string, 'force'|'recommend'>} */
+  const parsed = new Map();
+  for (const entry of entries) {
+    const parts = entry.trim().split('=');
+    if (parts.length !== 2) return empty;
+    const slug = parts[0].trim();
+    const mode = parts[1].trim();
+    if ((slug !== '*' && !SEAT_SLUG.test(slug)) || !SEAT_POLICY_MODES.has(mode)
+        || parsed.has(slug) || (slug !== '*' && !slugs.includes(slug))) return empty;
+    parsed.set(slug, /** @type {'force'|'recommend'} */ (mode));
+  }
+  const fallback = parsed.get('*') ?? 'recommend';
+  const out = new Map();
+  slugs.forEach((slug, i) => out.set(indices[i], parsed.get(slug) ?? fallback));
+  return out;
+}
 
 /**
  * @typedef {{ name: string, clients: string[], accounts: string[] }} ClientRoute
@@ -334,15 +374,31 @@ const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
  * @param {number[]} indices  the seat's accounts, in config order
  * @param {number} currentIdx  the pinned account the answer is about
  * @param {string|null} [model]
- * @returns {string|null} the account's name, or null when nothing else serves
+ * @param {string|null} [advisorModel]
+ * @param {Set<number>|null} [excluded]
+ * @returns {number|null} the account's index, or null when nothing else serves
  */
-export function nextInSeatQueue(accountManager, indices, currentIdx, model = null) {
+export function nextInSeatQueueIndex(accountManager, indices, currentIdx, model = null, advisorModel = null, excluded = null) {
   for (const i of indices) {
-    if (i === currentIdx) continue;
+    if (i === currentIdx || excluded?.has(i)) continue;
     const account = accountManager.accounts[i];
-    if (account && !seatVerdict(accountManager, account, model, null)) return account.name;
+    if (account && !seatVerdict(accountManager, account, model, advisorModel)) return i;
   }
   return null;
+}
+
+/**
+ * The named form of nextInSeatQueueIndex for the handoff offer.
+ * @param {any} accountManager
+ * @param {number[]} indices
+ * @param {number} currentIdx
+ * @param {string|null} [model]
+ * @param {string|null} [advisorModel]
+ * @returns {string|null}
+ */
+export function nextInSeatQueue(accountManager, indices, currentIdx, model = null, advisorModel = null) {
+  const i = nextInSeatQueueIndex(accountManager, indices, currentIdx, model, advisorModel);
+  return i == null ? null : accountManager.accounts[i].name;
 }
 
 /**
@@ -376,14 +432,17 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null,
       // A conversation pinned inside a multi-account seat is told the queue:
       // the next account would serve, at one full-price cold-cache turn, and
       // a handoff is the cheaper way to get there.
+      const continuationOffer = queue?.next != null;
       const queueHint = queue
         ? queue.next
-          ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", one of this seat's accounts. "${safeLine(queue.next, 64)}" is next in the seat's queue and has quota, but continuing there re-processes this whole conversation once at full price (cold prompt cache). Recommended instead: run /ipm:handoff, then start a fresh session — it lands on "${safeLine(queue.next, 64)}" with a compact summary.`
+          ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}". Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account with quota, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that still has quota, currently "${safeLine(queue.next, 64)}", using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required.`
           : ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`
         : '';
       return {
         status: 429,
-        headers: { ...json, ...(rej?.headers || {}), 'x-should-retry': 'false' },
+        // Unified headers make Claude Code replace the body with its generic
+        // plan-limit banner. This actionable offer must show the whole choice.
+        headers: { ...json, ...(continuationOffer ? {} : (rej?.headers || {})), 'x-should-retry': 'false' },
         body: err('rate_limit_error', `Your Claude seat${shown ? ` ${shown}` : ''} is out of quota${when ? ` until ${when}` : ''}.${queueHint} ${KIMI_HINT}`),
       };
     }

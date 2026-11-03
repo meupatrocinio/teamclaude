@@ -12,7 +12,7 @@ import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { stampGatewayUser } from './user-identity.js';
-import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue } from './client-routes.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
@@ -182,6 +182,11 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
 const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-connection', 'te', 'trailer',
+]);
+
+const SEAT_INTERNAL_HEADERS = new Set([
+  'x-teamclaude-seat-policy',
+  'x-teamclaude-seat-failover',
 ]);
 
 // Response headers describing the SERVING organization's billing state:
@@ -1312,7 +1317,7 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
     // x-api-key may authenticate to this proxy or to the destination API.
     // Consume our own keys, preserving unrelated application credentials. With
     // no usable key configured every value "resolves", so that case keeps it.
@@ -1324,7 +1329,7 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
   const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key)) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -1725,7 +1730,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // direct request carries its key as req.tcClient, a MITM tunnel as
       // forcedClient (fixed at CONNECT), and a request with neither is the
       // shared proxy key or key-less loopback.
-      /** @type {{ route: string, indices: number[] }|null} */
+      /** @type {{ route: string, indices: number[], policies: Map<number, 'force'|'recommend'> }|null} */
       let bound = null;
       /** @type {string|null} */
       let gate = null;
@@ -1772,7 +1777,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
               if (!catalog) { refuse(SEAT_REASONS.unavailable, `(seat ${safeLine(routed.name, 64)} unresolved)`, r.problem); return; }
               noAffinity = true;
             } else {
-              bound = { route: routed.name, indices: r.indices };
+              bound = { route: routed.name, indices: r.indices, policies: parseSeatPolicies(req.headers['x-teamclaude-seat-policy'], routed, r.indices) };
               if (r.indices.length === 1) pinnedIndex = r.indices[0];
             }
           } else if (required) {
@@ -1901,7 +1906,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
       // x-tc-caller is the operator's own attribution hint (see the gate above).
-      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller']);
+      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy']);
 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
@@ -2184,7 +2189,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
     // The client's identity on this path is its bearer; x-api-key is how it
     // authenticated to THIS proxy, so relaying it would hand the operator's
     // proxy key to upstream.
@@ -2199,7 +2204,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
   const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -2340,7 +2345,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     // the handshake. Only 'host' (the client transport reconstructs it from
     // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
     // credential to us, not to upstream) are dropped.
-    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
+    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
     headers[key] = value;
   }
 
@@ -2355,7 +2360,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)) && !SEAT_INTERNAL_HEADERS.has(k.toLowerCase()))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     // Lines joined, one terminator: an empty header set must not leave a blank
     // line inside (or an extra CRLF after) the response head.
@@ -2393,7 +2398,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
     const headerLines = Object.entries(upstreamRes.headers)
       .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
-      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)) && !SEAT_INTERNAL_HEADERS.has(k.toLowerCase()))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     try {
       socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
@@ -2473,7 +2478,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // `.text()` already decompressed the body, so drop content-encoding and
       // the now-stale content-length (both refer to the compressed bytes) — else
       // a gzip'd upstream response reaches the client mis-framed / truncated.
-      if (key === 'transfer-encoding' || key === 'connection' ||
+      if (key === 'transfer-encoding' || key === 'connection' || SEAT_INTERNAL_HEADERS.has(key) ||
           key === 'content-encoding' || key === 'content-length') continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
@@ -3189,6 +3194,17 @@ function logSeatEvent(client, seat, reason, status, detail = null) {
 }
 
 /**
+ * The request-local mode for one bound account. Missing or invalid policy data
+ * always means recommend.
+ * @param {Record<string, any>} ctx
+ * @param {number} accountIndex
+ * @returns {'force'|'recommend'}
+ */
+function seatPolicyFor(ctx, accountIndex) {
+  return ctx.bound?.policies.get(accountIndex) ?? 'recommend';
+}
+
+/**
  * Answer a bound request whose seat cannot serve it (IPM fork). Never another
  * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
  * When the request was pinned to one account of a multi-account seat
@@ -3205,7 +3221,8 @@ function logSeatEvent(client, seat, reason, status, detail = null) {
 function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, accountIndex = null) {
   const reason = verdictReason(verdict);
   const detail = verdict.kind === 'unavailable' ? verdict.reason : null;
-  const queue = accountManager && accountIndex != null && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
+  const queue = accountManager && accountIndex != null && seatPolicyFor(ctx, accountIndex) === 'recommend'
+    && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
     ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model) }
     : null;
   const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue });
@@ -3218,7 +3235,48 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
   if (!res.headersSent && !clientGone(res)) {
     res.writeHead(answer.status, answer.headers);
     res.end(answer.body);
+    if (ctx.boundPinned && verdict.kind === 'spent' && queue?.next
+        && ctx.bound.indices.length > 1 && ctx.pinKey && ctx.client && ctx.seat && accountIndex != null) {
+      const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+      accountManager.sessionTracker.recordSeatContinuation(ctx.pinKey, {
+        client: ctx.client,
+        route: ctx.seat,
+        bucket,
+        idx: accountIndex,
+        at: verdict.rejection.at,
+        resetsAt: verdict.rejection.resetsAt,
+      });
+    }
   }
+}
+
+/**
+ * A force-mode quota hop to another account of the same bound seat. The explicit
+ * hop bypasses offer consumption and keeps the destination's own policy/pin
+ * semantics; the original request body is reused by the caller.
+ * @param {any} accountManager
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} verdict
+ * @returns {boolean} whether ctx.hopTo now names a servable sibling
+ */
+function hopForcedSeat(accountManager, ctx, account, verdict) {
+  if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null
+      || verdict.kind !== 'spent' || seatPolicyFor(ctx, account.index) !== 'force') return false;
+  const excluded = new Set([...ctx.tried, ...(ctx.rolledOff ?? [])]);
+  const next = nextInSeatQueueIndex(accountManager, ctx.bound.indices, account.index, ctx.model, ctx.advisorModel, excluded);
+  if (next == null) return false;
+  ctx.tried.add(account.index);
+  ctx.hopTo = next;
+  const destination = accountManager.accounts[next];
+  ctx.seatContinuation = {
+    from: ctx.seatContinuation?.from ?? account.name,
+    to: destination.name,
+    coldCache: true,
+    policy: 'force',
+  };
+  console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
+  return true;
 }
 
 /**
@@ -3242,7 +3300,34 @@ function pickBoundAccount(accountManager, ctx) {
   const pinIdx = ctx.pinKey ? accountManager.sessionTracker.pinnedAccount(ctx.pinKey, bucket) : null;
   if (pinIdx != null && left.includes(pinIdx)) {
     ctx.boundPinned = true;
-    return accountManager.accounts[pinIdx] ?? null;
+    const pinned = accountManager.accounts[pinIdx] ?? null;
+    if (!ctx.seatContinuationChecked && pinned && seatPolicyFor(ctx, pinIdx) === 'recommend') {
+      // Only a later top-level request may consume the disclosed continuation.
+      // Recursive selection can retain retryCount 0, so it cannot be the guard.
+      ctx.seatContinuationChecked = true;
+      const verdict = seatVerdict(accountManager, pinned, ctx.model, ctx.advisorModel);
+      if (verdict?.kind === 'spent') {
+        const next = left.find((/** @type {number} */ i) => i !== pinIdx
+          && !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+        if (next != null) {
+          const offer = accountManager.sessionTracker.takeSeatContinuation(ctx.pinKey, {
+            client: ctx.client,
+            route: ctx.seat,
+            bucket,
+            idx: pinIdx,
+            at: verdict.rejection.at,
+            resetsAt: verdict.rejection.resetsAt,
+          });
+          if (offer) {
+            const destination = accountManager.accounts[next];
+            ctx.tried.add(pinIdx);
+            ctx.seatContinuation = { from: pinned.name, to: destination.name, coldCache: true };
+            return destination;
+          }
+        }
+      }
+    }
+    return pinned;
   }
   // An unpinned pick, and a verdict retry must be free to advance the queue.
   ctx.boundPinned = false;
@@ -3540,6 +3625,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (ctx.bound) {
     const verdict = seatVerdict(accountManager, account, ctx.model, ctx.advisorModel);
     if (verdict) {
+      if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, verdict)) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
       // A pick made from the conversation's pin inside the seat keeps the
       // pinned account's verdict as the answer (boundPinned): re-selecting
       // onto a sibling account of the seat would move the whole conversation
@@ -3566,6 +3654,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account.index);
+    if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
   // The token has expired and the refresh did not replace it: the coordinator
@@ -3577,7 +3666,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     (ctx.unrenewed ??= new Set()).add(account.name);
     ctx.tried.add(account.index);
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
-    if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     return respondUnrenewed(res, ctx, accountManager);
@@ -3588,6 +3677,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // targets exactly the account it names.
   if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isRoutingDown(account.index)) {
     ctx.tried.add(account.index);
+    if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
@@ -3720,6 +3810,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account.index);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'entitlement' }, account.name, accountManager, account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     // Same for a cap: a reading that arrived while this request waited can have
@@ -3794,6 +3885,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : null;
     if (seatRejection && ctx.bound) {
       await upstreamRes.body?.cancel();
+      if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, { kind: 'spent', rejection: seatRejection })) {
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
       // A pin inside the seat keeps the hard stop (with the queue hint) rather
       // than re-selecting onto a sibling — same rule as the pre-send verdict.
       if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
@@ -3876,7 +3971,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if ((generalRejected || fableRejected || codexFamilyRejected) && !ctx.boundPinned && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -3968,7 +4063,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // which is the right response to an IP-scoped limit.
       // Never for a pinned request: a pin names exactly one account, and the
       // hop's ctx.hopTo would otherwise send it to a sibling nobody chose.
-      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -4131,7 +4226,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // client as it does today, with its own retry-after intact.
     // A pinned request takes no hop, as on the 429 path: its 5xx is the pinned
     // account's own answer and goes to the client.
-    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
@@ -4174,6 +4269,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
         : '';
       console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: entitlementDenied ? 'entitlement' : 'error' }, account.name, accountManager, account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -4214,7 +4310,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       (ctx.credentialRejected ??= new Set()).add(account.name);
       (ctx.rejectedStatus ??= new Map()).set(account.name, 401);
       ctx.tried.add(account.index);
-      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
+      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; ${ctx.boundPinned ? 'bound seat unavailable' : 'failing over to another account'}`);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -4234,7 +4331,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // runs per attempt), so the wedge does not re-form on the next turn. A
     // pinned request keeps its account's own answer, as on the 429/5xx paths;
     // a bound one hops only inside its seat (boundExclude).
-    if (ctx.pinnedIndex == null && upstreamRes.status === 400 && account.upstream
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && upstreamRes.status === 400 && account.upstream
         && !res.headersSent && !ctx.clientErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429/5xx hops, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
@@ -4281,7 +4378,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // decisive event instead of the status. The sibling is picked first so a
     // request with nowhere to hop to is never held for nothing.
     // Not for a pinned request, for the same reason as the two hops above.
-    if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
@@ -4319,7 +4416,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     /** @type {Record<string, string>} */
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       // Per-org billing state, dropped when stripOverageHeaders is on (see
@@ -4327,6 +4424,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (ctx.stripOverage === true && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
+
+    // Internal seat headers are authoritative only when this proxy sets them.
+    delete responseHeaders['x-teamclaude-seat-failover'];
+    delete responseHeaders['x-teamclaude-seat-policy'];
 
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
@@ -4339,6 +4440,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.synthesizeQuota === true && upstreamRes.status < 400
         && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
+    }
+
+    if (ctx.seatContinuation?.coldCache === true && upstreamRes.status < 400) {
+      const { from, to } = ctx.seatContinuation;
+      responseHeaders['x-teamclaude-seat-failover'] = `from=${encodeURIComponent(from)};to=${encodeURIComponent(to)};cold-cache=true`;
+      console.log(`[TeamClaude] Seat continuation "${safeLine(ctx.seat, 64)}": "${safeLine(from, 64)}" → "${safeLine(to, 64)}"; full conversation reprocessed with a cold prompt cache`);
     }
 
     res.writeHead(upstreamRes.status, responseHeaders);
@@ -4467,7 +4574,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // self-healing: probes from other requests refresh the stale quota.
     const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
     const thisHost = hostOf(account.upstream || upstream);
-    const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
+    const otherHostAvailable = ctx.pinnedIndex != null || ctx.boundPinned || accountManager.accounts.some(a =>
       a.index !== account.index && !ctx.tried.has(a.index) &&
       hostOf(a.upstream || upstream) !== thisHost &&
       accountManager._isAvailable(a, ctx.model));
@@ -4490,7 +4597,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // *response*, never a throw. So don't sideline the account (that would drop
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
-    if (retryCount < maxRetries && !res.headersSent) {
+    if (retryCount < maxRetries && !res.headersSent && !ctx.boundPinned) {
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }

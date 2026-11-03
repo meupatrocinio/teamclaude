@@ -26,12 +26,27 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
   "seat unavailable".
 - A route with several accounts is allowed. Its requests stay inside those accounts, and failover
   hops move only between them. The account list is a **drain queue in config order**: a
-  conversation pins to the first account it starts on and stays there until that account cannot
-  serve; a spent pinned account is a hard stop that names the queue's next account and recommends
-  a handoff to a fresh session (continuing mid-conversation would re-process the whole transcript
-  on a cold cache). Only a fresh conversation — one with no pin, as after a handoff — takes the
-  next servable account, so the seat's quota drains one account at a time instead of spreading
-  across all of them at once.
+  conversation pins to the first account it starts on. Each account has a per-request quota policy,
+  selected by the caller (`recommend` by default, or `force`). The source account's policy governs
+  each move. Fresh conversations take the first servable account immediately, so the seat's quota
+  drains one account at a time instead of spreading across all of them at once.
+
+  - `recommend`: the first quota failure recommends `/ipm:handoff` and a fresh session, and warns
+    that continuing the same conversation will reprocess its full context with a cold prompt cache.
+    A later prompt in that same conversation confirms the switch once and re-pins there.
+  - `force`: the first real quota failure immediately retries the identical request body on the
+    first assigned account that can serve, preserving the conversation, and re-pins there. Every
+    force hop is independently authorized by the account that just failed.
+
+  If the destination also spends out, its own policy applies: a recommend destination offers and
+  requires confirmation before moving again, while a force destination retries immediately. A
+  single-account route has nowhere to move, so both modes retain the hard stop.
+
+  `cg` sends the choices as `x-teamclaude-seat-policy: *=recommend,s1=recommend,s2=force`. The
+  renderer emits route slugs and accounts in the same order, so `s1+s2` maps those slugs to the two
+  resolved accounts by position. Missing entries mean recommend. Malformed entries, duplicates,
+  foreign slugs, or slug/account-length mismatches disable force for the whole request. The header
+  is a preference, never routing authority, and is stripped before the request reaches Anthropic.
 
 `POST /teamclaude/reload` applies both keys with no restart, in the same step as `proxy.clientKeys`.
 A request keeps the binding it read at admission for all its retries.
@@ -77,12 +92,22 @@ When the seat cannot serve, the answer always comes from the seat itself:
 | Seat state | Answer |
 |---|---|
 | Spent: upstream sent a 429 rejecting a quota window, and that window's reset is still ahead | 429 with upstream's own `anthropic-ratelimit-unified-*` headers and `x-should-retry: false`. The 429 that reports the spend gets this answer at once. Later requests get it with nothing sent upstream. A `7d_oi` rejection covers Fable requests only. |
+| Spent pinned account in a multi-account route, with a servable sibling | `recommend`: the first response is an actionable 429 handoff offer with `x-should-retry: false` and no unified headers, so Claude Code shows the handoff and cold-cache choices instead of its generic plan-limit banner. The next prompt confirms and switches once. `force`: the same request retries immediately on the sibling with its body unchanged. |
 | Throttled (rate-limit hold) | 429 with `retry-after`. It stays retryable. |
 | Operator budget cap (`maxUsage`, `maxSpend`) | 429 with `x-should-retry: false`. No unified headers are made up. |
 | Disabled, in error, credential or routing failure, route unresolved or ambiguous | 503 with `x-should-retry: false` |
 
 If the state is unknown (no reading yet, or a reset time already past), the request goes to the
 seat, and upstream's answer is recorded for the next request. teamclaude never makes up a reset time.
+
+A successful confirmed continuation adds `x-teamclaude-seat-failover` with the source, destination
+and `cold-cache=true`. It does not alter the assistant's response body or SSE events. Upstream-supplied
+copies of the internal policy/failover headers are discarded.
+
+Force applies only to genuine quota rejection. Throttling, credential/entitlement failures, 5xx,
+third-party 400s, stream failures, transport errors, operator caps, and token/routing failures never
+move a pinned conversation to a sibling. Fresh, unpinned conversations keep their ordinary queue
+advance behavior.
 
 ## Operator overrides
 
