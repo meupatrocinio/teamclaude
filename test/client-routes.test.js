@@ -5,7 +5,7 @@ import { resolveAccountPin } from '../src/server.js';
 import {
   parseClientRoutes, routeForClient, resolveClientRoute, clientRoutePolicyActive,
   recordSeatRejection, liveSeatRejection, clearSeatRejection, seatVerdict, combineVerdicts,
-  seatAnswer, SEAT_REASONS, clientRoutesStatus, callerSeat,
+  seatAnswer, SEAT_REASONS, clientRoutesStatus, callerSeat, parseSeatPolicies,
 } from '../src/client-routes.js';
 
 // Unit half of the client-route (fixed seat) feature, IPM fork AI-1552: the
@@ -46,6 +46,27 @@ test('parse: malformed input never throws and warns', () => {
   const t = parseClientRoutes([null, { clients: ['a'] }, { name: 'ok', clients: ['b', 7, ''], accounts: [] }, 'x']);
   assert.deepEqual(t.routes, [{ name: 'ok', clients: ['b'], accounts: [] }]);
   assert.ok(t.warnings.some(w => /names no account/.test(w)));
+});
+
+test('seat policies map renderer slugs to resolved accounts and default to recommend', () => {
+  const route = { name: 's1+s2', clients: ['amy'], accounts: ['a@x', 'b@x'] };
+  assert.deepEqual(parseSeatPolicies(undefined, route, [4, 8]), new Map());
+  assert.deepEqual(parseSeatPolicies('*=recommend,s2=force', route, [4, 8]), new Map([[4, 'recommend'], [8, 'force']]));
+  assert.deepEqual(parseSeatPolicies('*=force,s1=recommend', route, [4, 8]), new Map([[4, 'recommend'], [8, 'force']]));
+});
+
+test('seat policies fail closed as a whole on malformed or ambiguous input', () => {
+  const route = { name: 's1+s2', clients: ['amy'], accounts: ['a@x', 'b@x'] };
+  const invalid = [
+    '', 's1', 's1=', 's1=FORCE', 's1=maybe', 's1=force=extra', 's1=force,s1=recommend',
+    '*=force,*=recommend', 'other=force', 's1 force', 's1=force,', `${'x'.repeat(41)}=force`,
+  ];
+  for (const raw of invalid) assert.deepEqual(parseSeatPolicies(raw, route, [4, 8]), new Map(), raw);
+  assert.deepEqual(parseSeatPolicies('s1=force', route, [4]), new Map(), 'resolved account count mismatch');
+  assert.deepEqual(parseSeatPolicies('s1=force', { ...route, accounts: ['a@x'] }, [4, 8]), new Map(), 'configured account count mismatch');
+  assert.deepEqual(parseSeatPolicies('s1=force', { ...route, name: 's1+s1' }, [4, 8]), new Map(), 'duplicate route slug');
+  assert.deepEqual(parseSeatPolicies('s1=force', route, [4, 4]), new Map(), 'duplicate account index');
+  assert.deepEqual(parseSeatPolicies('s1=force', { ...route, name: 'seat-q' }, [4, 8]), new Map(), 'hand-written multi-account route name');
 });
 
 test('policy is active with any route or with the switch on, and only then', () => {
@@ -186,6 +207,25 @@ test('answers: status codes and the headers Claude Code keys on', () => {
   assert.equal(spent.headers['anthropic-ratelimit-unified-5h-reset'], '1900000000');
   assert.equal(spent.headers['retry-after'], undefined);
   assert.match(JSON.parse(spent.body).error.message, /seat "seat-7" is out of quota until 2030-03-17T17:46:40.000Z\. Use `cg kimi on`/);
+
+  const offered = seatAnswer(SEAT_REASONS.spent, {
+    seat: 'seat-q', verdict: { kind: 'spent', rejection }, queue: { pinned: 'qa', next: 'qb' },
+  });
+  const offeredMessage = JSON.parse(offered.body).error.message;
+  assert.equal(offered.status, 429);
+  assert.equal(offered.headers['x-should-retry'], 'false');
+  assert.equal(offered.headers['anthropic-ratelimit-unified-5h-reset'], undefined, 'the offer must not trigger the generic plan-limit banner');
+  assert.match(offeredMessage, /\/ipm:handoff/);
+  assert.match(offeredMessage, /start a new conversation/);
+  assert.match(offeredMessage, /reprocess the full conversation/);
+  assert.match(offeredMessage, /cold prompt cache/);
+  assert.match(offeredMessage, /next prompt confirms/);
+  assert.match(offeredMessage, /No additional confirmation prompt is required/);
+
+  const noSibling = seatAnswer(SEAT_REASONS.spent, {
+    seat: 'seat-q', verdict: { kind: 'spent', rejection }, queue: { pinned: 'qa', next: null },
+  });
+  assert.equal(noSibling.headers['anthropic-ratelimit-unified-5h-reset'], '1900000000', 'no offer keeps the ordinary spent response');
 
   const throttled = seatAnswer(SEAT_REASONS.throttled, { verdict: { kind: 'throttled', retryAfter: 12 } });
   assert.equal(throttled.status, 429);

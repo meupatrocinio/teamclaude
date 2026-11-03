@@ -54,15 +54,29 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn, proxyAuth = nul
   });
 }
 
-async function setup() {
+async function setup({ multi = false } = {}) {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   /** @type {string[]} */
   const seen = [];
   /** @type {string[]} */
   const upgrades = [];
+  const policyHeaders = [];
+  const state = { spent: false };
   const upstream = http.createServer(async (req, res) => {
     for await (const c of req) void c;
-    seen.push(String(req.headers.authorization || '').replace(/^Bearer TOKEN-/, ''));
+    const who = String(req.headers.authorization || '').replace(/^Bearer TOKEN-/, '');
+    seen.push(who);
+    policyHeaders.push(req.headers['x-teamclaude-seat-policy']);
+    if (multi && state.spent && who === 'sa') {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-7d-status': 'rejected',
+        'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+      });
+      res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"type":"message","content":[],"usage":{"input_tokens":1,"output_tokens":1}}');
   });
@@ -73,7 +87,9 @@ async function setup() {
   const upPort = await listen(upstream);
   const quietLog = console.log;
   console.log = () => {};
-  const am = new AccountManager([oauth('sa'), oauth('sc')], 0.98, { clientRoutes: ROUTES });
+  const am = new AccountManager([oauth('sa'), oauth('sc')], 0.98, {
+    clientRoutes: multi ? [{ name: 's1+s2', clients: ['ana'], accounts: ['sa', 'sc'] }] : ROUTES,
+  });
   const config = { proxy: PROXY, upstream: `http://127.0.0.1:${upPort}`, mitm: { http1Only: false } };
   const direct = createProxyServer(am, config);
   const directPort = await listen(direct);
@@ -82,14 +98,19 @@ async function setup() {
   mitm.on('connect', createConnectHandler({ config, accountManager: am, ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }), log: () => {} }));
   const mitmPort = await listen(mitm);
   const close = () => { console.log = quietLog; closeHard(direct); closeHard(mitm); closeHard(upstream); };
-  return { am, caCertPem, upPort, seen, upgrades, directPort, mitmPort, close };
+  return { am, caCertPem, upPort, seen, upgrades, policyHeaders, state, directPort, mitmPort, close };
 }
 
 // One request on the direct path: `key` in x-api-key, an optional /tc-acct/ pin.
-async function viaDirect(env, { key, pin = null, session = null }) {
+async function viaDirect(env, { key, pin = null, session = null, policy = null }) {
   const res = await fetch(`http://127.0.0.1:${env.directPort}${pin ? `/tc-acct/${pin}` : ''}/v1/messages`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}), ...(session ? { 'x-claude-code-session-id': session } : {}) },
+    headers: {
+      'content-type': 'application/json',
+      ...(key ? { 'x-api-key': key } : {}),
+      ...(session ? { 'x-claude-code-session-id': session } : {}),
+      ...(policy ? { 'x-teamclaude-seat-policy': policy } : {}),
+    },
     body: '{"model":"claude-opus-4-1","messages":[]}',
   });
   await res.text();
@@ -98,12 +119,16 @@ async function viaDirect(env, { key, pin = null, session = null }) {
 
 // The same request through a CONNECT tunnel: the key in Proxy-Authorization,
 // a TC_ACCT pin in its username slot.
-async function viaMitm(env, { key, pin = null, session = null }) {
+async function viaMitm(env, { key, pin = null, session = null, policy = null }) {
   const auth = key ? basic(`${pin ?? ''}:${key}`) : (pin ? basic(`${pin}:`) : null);
   const sock = await connectThroughProxy(env.mitmPort, `127.0.0.1:${env.upPort}`, env.caCertPem, ['h2'], auth);
   const client = http2.connect('https://localhost', { createConnection: () => sock });
   try {
-    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json', ...(session ? { 'x-claude-code-session-id': session } : {}) });
+    const req = client.request({
+      ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json',
+      ...(session ? { 'x-claude-code-session-id': session } : {}),
+      ...(policy ? { 'x-teamclaude-seat-policy': policy } : {}),
+    });
     let status = 0;
     req.on('response', (h) => { status = Number(h[':status']); });
     req.resume();
@@ -143,6 +168,21 @@ for (const [path, send] of [['direct HTTP', viaDirect], ['MITM CONNECT', viaMitm
       }
     });
   }
+}
+
+for (const [path, send] of [['direct HTTP', viaDirect], ['MITM CONNECT', viaMitm]]) {
+  test(`${path}: force hops on the first quota failure and strips the policy header`, T, async () => {
+    const env = await setup({ multi: true });
+    try {
+      assert.equal(await send(env, { key: 'ana-key', session: 'force-session' }), 200);
+      env.state.spent = true;
+      assert.equal(await send(env, { key: 'ana-key', session: 'force-session', policy: '*=recommend,s1=force' }), 200);
+      assert.deepEqual(env.seen, ['sa', 'sa', 'sc']);
+      assert.ok(env.policyHeaders.every(v => v === undefined), 'the internal policy header reached upstream');
+    } finally {
+      env.close();
+    }
+  });
 }
 
 // ── WebSocket upgrades ───────────────────────────────────────────────────────
