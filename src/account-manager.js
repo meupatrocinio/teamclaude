@@ -3882,6 +3882,12 @@ export class AccountManager {
       // evidence than the probe.
       q.unified5h = null;
       q.unified5hSeenAt = null;
+      // As in the probe path, a rejection the remaining weekly readings do not
+      // explain belonged to the session window just removed.
+      if (q.unifiedStatus === 'rejected' && !this._weeklyExplainsRejection(account)) {
+        q.unifiedStatus = null;
+        q.unifiedStatusSeenAt = null;
+      }
       changed = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {

@@ -462,6 +462,36 @@ test('the sweep clears a session reading with no reset once the plan meters no f
   assert.equal(summary.accounts[0].buckets.fiveHour, null);
 });
 
+test('the no-reset sweep clears only a rejection the weekly window does not explain', () => {
+  const build = (/** @type {number} */ weekly) => {
+    const am = new AccountManager([oauth('a')], 0.98);
+    const q = am.accounts[0].quota;
+    am.applyUsageData(0, normalizeUsagePayload({ five_hour: { utilization: 0, resets_at: null }, seven_day: week() }));
+    Object.assign(q, { unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() });
+    const headers = weeklyOnly();
+    headers['anthropic-ratelimit-unified-7d-utilization'] = String(weekly);
+    delete headers['anthropic-ratelimit-unified-status'];
+    am.updateQuota(0, headers);
+    Object.assign(q, {
+      unified7d: weekly,
+      unified7dReset: Date.now() + 6 * HOUR,
+      unified7dSonnet: null,
+      unified7dFable: null,
+    });
+    am.sweepExpiredQuotas();
+    return q;
+  };
+
+  const unexplained = build(0.4);
+  assert.equal(unexplained.unified5h, null);
+  assert.equal(unexplained.unifiedStatus, null, 'the old session rejection leaves with its reading');
+  assert.equal(unexplained.unifiedStatusSeenAt, null);
+
+  const explained = build(0.99);
+  assert.equal(explained.unified5h, null);
+  assert.equal(explained.unifiedStatus, 'rejected', 'a spent weekly window still explains the verdict');
+});
+
 test('the sweep leaves a session reading with a future reset in place on a plan with no five-hour window', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const q = am.accounts[0].quota;
