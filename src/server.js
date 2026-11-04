@@ -3223,7 +3223,7 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
   const detail = verdict.kind === 'unavailable' ? verdict.reason : null;
   const queue = accountManager && accountIndex != null && seatPolicyFor(ctx, accountIndex) === 'recommend'
     && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
-    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model) }
+    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model, ctx.advisorModel) }
     : null;
   const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue });
   ctx.status = answer.status;

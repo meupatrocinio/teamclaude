@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { recordSeatRejection, seatVerdict } from '../src/client-routes.js';
 
 // The seat queue (IPM fork): a multi-account seat is a drain queue in config
 // order. The first quota failure on a pinned conversation recommends a handoff
@@ -66,7 +67,7 @@ async function withGateway({ handler = (_who, res) => ok(res) } = {}, fn) {
   const port = await listen(proxy);
   // One turn of one conversation: the body identifies the conversation, so
   // `text` distinguishes conversations under one session id.
-  const send = async ({ key = KEYS.amy, session = 's-1', text = 'hello', policy } = {}) => {
+  const send = async ({ key = KEYS.amy, session = 's-1', text = 'hello', policy, advisor } = {}) => {
     const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -75,7 +76,11 @@ async function withGateway({ handler = (_who, res) => ok(res) } = {}, fn) {
         'x-claude-code-session-id': session,
         ...(policy === undefined ? {} : { 'x-teamclaude-seat-policy': policy }),
       },
-      body: JSON.stringify({ model: 'claude-opus-4-1', messages: [{ role: 'user', content: text }] }),
+      body: JSON.stringify({
+        model: 'claude-opus-4-1',
+        ...(advisor ? { tools: [{ type: 'advisor_20260301', name: 'advisor', model: advisor }] } : {}),
+        messages: [{ role: 'user', content: text }],
+      }),
     });
     const raw = await res.text();
     let json = null;
@@ -141,6 +146,30 @@ test('a spent pin offers handoff first; the next same-conversation prompt contin
     const fresh = await send({ text: 'a new conversation' });
     assert.equal(fresh.status, 200);
     assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qb', 'qb']);
+  });
+});
+
+test('a continuation offer requires the next account to serve the advisor model too', async () => {
+  let qaSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, am }) => {
+    Object.assign(am.accounts[1].quota, {
+      unified7dFable: 1,
+      unified7dFableReset: Date.now() + HOUR,
+      unified7dFableSeenAt: Date.now(),
+    });
+    recordSeatRejection(am.accounts[1], {
+      'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+      'anthropic-ratelimit-unified-7d_oi-reset': sec(Date.now() + HOUR),
+    }, 'claude-fable-5');
+    assert.ok(seatVerdict(am, am.accounts[1], 'claude-opus-4-1', 'claude-fable-5'), 'qb is spent for the advisor');
+    assert.equal(am.unavailableReason(am.accounts[1], 'claude-opus-4-1', 'claude-fable-5'), 'advisor-quota');
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    qaSpent = true;
+    const stopped = await send({ text: 'hello', advisor: 'claude-fable-5' });
+    assert.equal(stopped.status, 429);
+    const msg = stopped.json?.error?.message ?? '';
+    assert.ok(msg.includes('currently "qc"'), `the advisor-ineligible qb was offered: ${msg}`);
+    assert.ok(!msg.includes('currently "qb"'), msg);
   });
 });
 

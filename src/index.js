@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import net from 'node:net';
+import { isProxyUp } from './proxy-up.js';
 import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
@@ -929,7 +929,7 @@ async function serverCommand() {
   // on first use. Skipped when something already listens on the port: this
   // start is about to fail, and the server holding the port presents the
   // chain on disk.
-  if (existsSync(caCertPath()) && !(await isProxyUp(port).catch(() => true))) {
+  if (existsSync(caCertPath()) && !(await isProxyUp(port, bindHost).catch(() => true))) {
     await ensureCerts(mitmHosts(config)).catch((err) => console.error(`[TeamClaude] Could not renew the MITM certificate: ${err.message}`));
   }
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
@@ -3309,20 +3309,6 @@ async function notifyRunningServer(config) {
       console.log(`Reloaded running server${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     }
   } catch { /* no server running — nothing to notify */ }
-}
-
-// Quick liveness probe: is something listening on the local proxy port?
-// A successful TCP connect is enough (the proxy is local). Times out fast so a
-// down proxy doesn't add noticeable latency to `claude` launches via the alias.
-function isProxyUp(port, timeout = 600) {
-  return new Promise(resolve => {
-    const socket = net.connect({ host: '127.0.0.1', port });
-    const done = up => { socket.destroy(); resolve(up); };
-    socket.setTimeout(timeout);
-    socket.once('connect', () => done(true));
-    socket.once('timeout', () => done(false));
-    socket.once('error', () => resolve(false));
-  });
 }
 
 function handleServerListenError(err, port) {
