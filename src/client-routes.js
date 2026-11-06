@@ -34,6 +34,7 @@
 import { safeLine } from './safe-text.js';
 import { DEFAULT_PROVIDER, providerOf, isSubscriptionAccount } from './provider.js';
 import { weeklyBucketForModel } from './model.js';
+import { accountSupportsModel } from './openai-chat-adapter.js';
 
 /** Activity-log reasons, one per gate outcome or hard stop. */
 export const SEAT_REASONS = Object.freeze({
@@ -329,6 +330,9 @@ const CAPPED = new Set(['capped', 'spend-capped', 'advisor-capped']);
  */
 export function seatVerdict(accountManager, account, model, advisorModel = null, now = Date.now()) {
   if (!account) return { kind: 'unavailable', reason: 'unresolved' };
+  if (!accountSupportsModel(account, model) || !accountSupportsModel(account, advisorModel)) {
+    return { kind: 'unavailable', reason: 'model-adapter' };
+  }
   const bucketFor = (/** @type {string|null} */ m) => accountManager._weeklyBucketFor?.(m) ?? weeklyBucketForModel(m);
   const reason = accountManager.unavailableReason(account, model, advisorModel);
   const spent = liveSeatRejection(account, model, bucketFor, now)

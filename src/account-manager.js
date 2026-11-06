@@ -16,6 +16,7 @@ import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
+import { accountSupportsModel } from './openai-chat-adapter.js';
 import { envVar } from './brand.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
@@ -443,6 +444,9 @@ function makeAccount(acct, index, listener = null) {
     // between providers keeps saying the same thing.
     autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
+    adapter: acct.adapter ?? null,
+    modelPrefix: acct.modelPrefix ?? null,
+    serverHeader: acct.serverHeader ?? null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.
@@ -3677,6 +3681,7 @@ export class AccountManager {
    * route — or a route that lists no accounts — it falls back to the per-account
    * `models` ownership claim (deprecated — use `routes` instead). */
   _routeAllows(account, model) {
+    if (!accountSupportsModel(account, model)) return false;
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
       return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));
