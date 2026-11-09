@@ -436,18 +436,18 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null,
       // A conversation pinned inside a multi-account seat is told the queue:
       // the next account would serve, at one full-price cold-cache turn, and
       // a handoff is the cheaper way to get there.
-      const continuationOffer = queue?.next != null;
-      const queueHint = queue
-        ? queue.next
-          ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}". Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account with quota, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that still has quota, currently "${safeLine(queue.next, 64)}", using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required.`
-          : ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`
+      const continuationMessage = queue && queue.next
+        ? `You can keep working by moving to another assigned account; "${safeLine(queue.next, 64)}" appears available. The account "${safeLine(queue.pinned, 64)}", pinned to this conversation, cannot serve this request because its quota is exhausted${when ? ` until ${when}` : ''}. Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account that appears available, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that appears available at that time, using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required. ${KIMI_HINT}`
+        : null;
+      const queueHint = queue && !queue.next
+        ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`
         : '';
       return {
         status: 429,
         // Unified headers make Claude Code replace the body with its generic
         // plan-limit banner. This actionable offer must show the whole choice.
-        headers: { ...json, ...(continuationOffer ? {} : (rej?.headers || {})), 'x-should-retry': 'false' },
-        body: err('rate_limit_error', `Your Claude seat${shown ? ` ${shown}` : ''} is out of quota${when ? ` until ${when}` : ''}.${queueHint} ${KIMI_HINT}`),
+        headers: { ...json, ...(continuationMessage ? {} : (rej?.headers || {})), 'x-should-retry': 'false' },
+        body: err('rate_limit_error', continuationMessage || `Your Claude seat${shown ? ` ${shown}` : ''} is out of quota${when ? ` until ${when}` : ''}.${queueHint} ${KIMI_HINT}`),
       };
     }
     case SEAT_REASONS.throttled: {
