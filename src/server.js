@@ -3758,6 +3758,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     delete headers['x-api-key'];
     headers.authorization = `Bearer ${account.credential}`;
     if (account.serverHeader != null) headers.server = String(account.serverHeader);
+    // Server-owned per-account headers (accounts[].adapterHeaders) — the
+    // Gemini admission header the Antigravity sidecar requires is one. Applied
+    // AFTER the client-header copy above, and any client-sent header of the
+    // same name is evicted first (the copy keeps the client's casing, so match
+    // case-insensitively): these belong to the operator, and a client must not
+    // replace or duplicate them. This block runs on every attempt — retries
+    // re-enter forwardRequest and rebuild the header set — so every upstream
+    // try carries them.
+    if (account.adapterHeaders) {
+      for (const [name, value] of Object.entries(account.adapterHeaders)) {
+        const lower = name.toLowerCase();
+        for (const existing of Object.keys(headers)) {
+          if (existing.toLowerCase() === lower) delete headers[existing];
+        }
+        headers[name] = value;
+      }
+    }
   }
 
   const upstreamUrl = isOpenAIChatAccount(account)

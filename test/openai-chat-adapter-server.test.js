@@ -60,6 +60,7 @@ async function fixture({ stream = false, agyHandler = null, claudeHandler = null
     {
       name: 'gemini', type: 'apikey', apiKey: 'gemini-secret', adapter: 'openai-chat',
       upstream: `http://127.0.0.1:${agyPort}/agy`, modelPrefix: 'gemini-', serverHeader: 'agy-test',
+      adapterHeaders: { 'x-bridge-client-ip': '127.0.0.1' },
     },
     { name: 'claude', type: 'apikey', apiKey: 'claude-secret', upstream: `http://127.0.0.1:${claudePort}` },
   ], 0.98, { clientRoutes });
@@ -102,6 +103,7 @@ for (const stream of [false, true]) {
       assert.equal(upstream.headers.authorization, 'Bearer gemini-secret');
       assert.equal(upstream.headers['x-api-key'], undefined);
       assert.equal(upstream.headers.server, 'agy-test');
+      assert.equal(upstream.headers['x-bridge-client-ip'], '127.0.0.1', 'the server-owned admission header did not reach the sidecar exactly');
       assert.equal(upstream.body.model, MODEL, 'the native ID was prefixed twice');
       assert.equal(upstream.body.reasoning_effort, 'high');
       if (stream) assert.deepEqual(upstream.body.stream_options, { include_usage: true });
@@ -177,6 +179,8 @@ test('ordinary Claude requests cannot select Gemini and disabled Gemini never fa
     assert.equal(ordinary.status, 200, ordinary.body);
     assert.equal(ctx.agyRequests.length, 0);
     assert.equal(ctx.claudeRequests.length, 1);
+    assert.equal(ctx.claudeRequests[0].headers['x-bridge-client-ip'], undefined,
+      'an unrelated account emitted the Gemini admission header');
 
     ctx.am.setDisabled(0, true);
     const gemini = await ctx.post(request());
@@ -277,6 +281,51 @@ test('an agy failure never fails over to an ordinary Claude account', async () =
     const res = await ctx.post(request());
     assert.equal(res.status, 500, res.body);
     assert.equal(ctx.agyRequests.length, 1);
+    assert.equal(ctx.claudeRequests.length, 0);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('a client-sent header can never replace or duplicate a server-owned adapterHeader', async () => {
+  const ctx = await fixture();
+  try {
+    const res = await ctx.post(request(), { headers: { 'X-Bridge-Client-Ip': '10.0.0.99' } });
+    assert.equal(res.status, 200, res.body);
+    assert.equal(ctx.agyRequests.length, 1);
+    // node joins repeated headers with a comma, so strict equality also proves
+    // the client's casing did not slip a second copy of the header through.
+    assert.equal(ctx.agyRequests[0].headers['x-bridge-client-ip'], '127.0.0.1');
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('every upstream attempt carries the adapterHeaders, including a same-account retry', async () => {
+  let attempts = 0;
+  const ctx = await fixture({
+    agyHandler: (_req, res) => {
+      attempts += 1;
+      if (attempts === 1) {
+        // A throttling 429 (retry-after, no quota-rejection headers) is absorbed
+        // inline: the proxy waits and retries the SAME account, rebuilding the
+        // upstream headers for the second attempt (server.js forwardRequest).
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });
+        res.end(JSON.stringify({ error: { message: 'slow down' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(completion()));
+    },
+  });
+  try {
+    const res = await ctx.post(request(), { path: '/tc-acct/gemini/v1/messages' });
+    assert.equal(res.status, 200, res.body);
+    assert.equal(ctx.agyRequests.length, 2, 'the 429 was not retried on the pinned account');
+    for (const attempt of ctx.agyRequests) {
+      assert.equal(attempt.headers['x-bridge-client-ip'], '127.0.0.1', 'an attempt reached the sidecar without the exact admission header');
+      assert.equal(attempt.headers.authorization, 'Bearer gemini-secret');
+    }
     assert.equal(ctx.claudeRequests.length, 0);
   } finally {
     await ctx.close();

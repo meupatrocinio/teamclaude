@@ -365,6 +365,50 @@ export function accountRouting(acct, listener = null) {
   }
 }
 
+// RFC 7230 token: the only legal HTTP header name. An adapterHeaders entry
+// whose name is not a token, or whose value carries a CR/LF, would throw
+// inside fetch on every request the account serves — or worse, smuggle an
+// extra header line — so it is refused here, once, at account load.
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Server-owned headers this account adds to every OpenAI-chat upstream request
+ * (accounts[].adapterHeaders) — e.g. the Gemini admission header the
+ * Antigravity sidecar requires, `x-bridge-client-ip: 127.0.0.1`. Server-owned
+ * means the client's own headers can never replace them: server.js applies
+ * them after the client-header copy, evicting any same-named client header.
+ * Only a plain object of RFC 7230 header names to string values without CR/LF
+ * is accepted; anything else is dropped with one line, since one malformed
+ * entry must not take down fleet construction. A copy is returned so a later
+ * edit of the config object cannot mutate the running account. The
+ * constructor and the config reload both come through here so a value refused
+ * at startup is refused on reload too.
+ * @param {Record<string, any>} acct
+ * @returns {Record<string, string>|null}
+ */
+export function accountAdapterHeaders(acct) {
+  const raw = acct?.adapterHeaders;
+  if (raw == null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring adapterHeaders — it must be an object of header names to string values`);
+    return null;
+  }
+  /** @type {Record<string, string>} */
+  const out = {};
+  let dropped = 0;
+  for (const [name, value] of Object.entries(raw)) {
+    if (!HEADER_NAME.test(name) || typeof value !== 'string' || /[\r\n]/.test(value)) {
+      dropped++;
+      continue;
+    }
+    out[name] = value;
+  }
+  if (dropped) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${dropped} adapterHeaders ${dropped === 1 ? 'entry' : 'entries'} — names must be valid header names and values strings without CR/LF`);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -447,6 +491,13 @@ function makeAccount(acct, index, listener = null) {
     adapter: acct.adapter ?? null,
     modelPrefix: acct.modelPrefix ?? null,
     serverHeader: acct.serverHeader ?? null,
+    // Server-owned headers added to every OpenAI-chat upstream request
+    // (accounts[].adapterHeaders) — the Gemini admission header the sidecar
+    // requires is one. Validated and copied by accountAdapterHeaders; server.js
+    // applies them after the client-header copy, so the client can never
+    // replace them. `null`, not `{}`, for "none": sync-accounts tells a
+    // removal apart from an empty set by the same value the constructor reads.
+    adapterHeaders: accountAdapterHeaders(acct),
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.

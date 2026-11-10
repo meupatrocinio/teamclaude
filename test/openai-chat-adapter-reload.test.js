@@ -5,6 +5,7 @@ import { mergeAccountsForSave } from '../src/account-pairing.js';
 import { syncAccountsFromDisk } from '../src/sync-accounts.js';
 
 const FIELDS = { adapter: 'openai-chat', modelPrefix: 'models/', serverHeader: 'agy-one' };
+const HEADERS = { 'x-bridge-client-ip': '127.0.0.1' };
 const entry = (extra = {}) => ({ id: 'x', name: 'x@example.com', type: 'apikey', apiKey: 'k', ...extra });
 
 async function roundTrip(startup, disk) {
@@ -17,41 +18,69 @@ async function roundTrip(startup, disk) {
 }
 
 test('startup carries adapter fields and ordinary accounts default to null', () => {
-  const am = new AccountManager([entry(FIELDS), entry({ id: 'y', name: 'y' })], 0.98);
+  const am = new AccountManager([entry({ ...FIELDS, adapterHeaders: HEADERS }), entry({ id: 'y', name: 'y' })], 0.98);
   assert.equal(am.accounts[0].adapter, 'openai-chat');
   assert.equal(am.accounts[0].modelPrefix, 'models/');
   assert.equal(am.accounts[0].serverHeader, 'agy-one');
-  for (const field of Object.keys(FIELDS)) assert.equal(am.accounts[1][field], null);
+  assert.deepEqual(am.accounts[0].adapterHeaders, HEADERS);
+  for (const field of [...Object.keys(FIELDS), 'adapterHeaders']) assert.equal(am.accounts[1][field], null);
+});
+
+test('the running account holds its own copy of adapterHeaders', () => {
+  const configured = { ...HEADERS };
+  const am = new AccountManager([entry({ adapter: 'openai-chat', adapterHeaders: configured })], 0.98);
+  assert.notEqual(am.accounts[0].adapterHeaders, configured, 'a later edit of the config object would mutate the running account');
+  configured['x-bridge-client-ip'] = '10.0.0.99';
+  assert.equal(am.accounts[0].adapterHeaders['x-bridge-client-ip'], '127.0.0.1');
 });
 
 test('runtime additions carry the same adapter fields', async () => {
   const am = new AccountManager([], 0.98);
   const memConfig = { accounts: [] };
-  const added = await syncAccountsFromDisk({ accounts: [entry(FIELDS)] }, memConfig, am);
+  const added = await syncAccountsFromDisk({ accounts: [entry({ ...FIELDS, adapterHeaders: HEADERS })] }, memConfig, am);
   assert.equal(added.added, 1);
   assert.equal(am.accounts[0].adapter, 'openai-chat');
   assert.equal(am.accounts[0].modelPrefix, 'models/');
   assert.equal(am.accounts[0].serverHeader, 'agy-one');
+  assert.deepEqual(am.accounts[0].adapterHeaders, HEADERS);
 });
 
 test('reload edits survive the next save and a second reload', async () => {
-  const startup = entry({ adapter: 'openai-chat', modelPrefix: 'old/', serverHeader: 'old' });
-  const disk = entry({ adapter: 'openai-chat', modelPrefix: 'models/', serverHeader: 'agy-two' });
+  const startup = entry({ adapter: 'openai-chat', modelPrefix: 'old/', serverHeader: 'old', adapterHeaders: { 'x-bridge-client-ip': '10.0.0.1' } });
+  const disk = entry({ adapter: 'openai-chat', modelPrefix: 'models/', serverHeader: 'agy-two', adapterHeaders: HEADERS });
   const { written, running, memConfig } = await roundTrip(startup, disk);
   assert.equal(written.adapter, 'openai-chat');
   assert.equal(written.modelPrefix, 'models/');
   assert.equal(written.serverHeader, 'agy-two');
+  assert.deepEqual(written.adapterHeaders, HEADERS);
   assert.equal(running.adapter, 'openai-chat');
   assert.equal(running.modelPrefix, 'models/');
   assert.equal(running.serverHeader, 'agy-two');
+  assert.deepEqual(running.adapterHeaders, HEADERS);
   assert.equal(memConfig.accounts[0].serverHeader, 'agy-two');
+  assert.deepEqual(memConfig.accounts[0].adapterHeaders, HEADERS);
 });
 
 test('removing adapter fields on disk deletes their mirrors instead of resurrecting them', async () => {
-  const { written, running, memConfig } = await roundTrip(entry(FIELDS), entry());
-  for (const field of Object.keys(FIELDS)) {
+  const { written, running, memConfig } = await roundTrip(entry({ ...FIELDS, adapterHeaders: HEADERS }), entry());
+  for (const field of [...Object.keys(FIELDS), 'adapterHeaders']) {
     assert.equal(field in written, false, `${field} was resurrected by the save`);
     assert.equal(field in memConfig.accounts[0], false);
     assert.equal(running[field], null);
   }
+});
+
+test('malformed adapterHeaders are dropped without failing account construction', () => {
+  const am = new AccountManager([
+    entry({ id: 'a', name: 'a', adapterHeaders: ['x-bridge-client-ip'] }),
+    entry({ id: 'b', name: 'b', adapterHeaders: { 'x-bridge-client-ip': 42 } }),
+    entry({ id: 'c', name: 'c', adapterHeaders: { 'bad name': 'x', 'x-ok': 'fine' } }),
+    entry({ id: 'd', name: 'd', adapterHeaders: { 'x-smuggle': 'one\r\nx-injected: two' } }),
+    entry({ id: 'e', name: 'e', adapterHeaders: {} }),
+  ], 0.98);
+  assert.equal(am.accounts[0].adapterHeaders, null, 'an array is not a header set');
+  assert.equal(am.accounts[1].adapterHeaders, null, 'a non-string value drops the set it would smuggle');
+  assert.deepEqual(am.accounts[2].adapterHeaders, { 'x-ok': 'fine' }, 'an invalid name drops only its own entry');
+  assert.equal(am.accounts[3].adapterHeaders, null, 'a CR/LF value is header injection');
+  assert.equal(am.accounts[4].adapterHeaders, null, 'an empty set is no headers');
 });
