@@ -366,10 +366,15 @@ export function accountRouting(acct, listener = null) {
 }
 
 // RFC 7230 token: the only legal HTTP header name. An adapterHeaders entry
-// whose name is not a token, or whose value carries a CR/LF, would throw
-// inside fetch on every request the account serves — or worse, smuggle an
-// extra header line — so it is refused here, once, at account load.
+// whose name is not a token, or whose value Node's HTTP client cannot write,
+// would throw inside the request on every call the account serves — or worse,
+// smuggle an extra header line — so it is refused here, once, at account load.
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// Node's own header-value rule (_http_common): a value is tab, visible ASCII,
+// or Latin-1 — nothing else. CR/LF are the smuggle case, but the other control
+// characters and any code point beyond Latin-1 (an emoji, say) throw
+// ERR_INVALID_CHAR just the same, so the check is the whole rule, not CR/LF.
+const HEADER_VALUE = /[^\t\x20-\x7e\x80-\xff]/;
 
 /**
  * Server-owned headers this account adds to every OpenAI-chat upstream request
@@ -377,8 +382,9 @@ const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
  * Antigravity sidecar requires, `x-bridge-client-ip: 127.0.0.1`. Server-owned
  * means the client's own headers can never replace them: server.js applies
  * them after the client-header copy, evicting any same-named client header.
- * Only a plain object of RFC 7230 header names to string values without CR/LF
- * is accepted; anything else is dropped with one line, since one malformed
+ * Only a plain object of RFC 7230 header names — unique ignoring case — to
+ * string values Node's HTTP client can write is accepted; anything else is
+ * dropped with one line, since one malformed
  * entry must not take down fleet construction. A copy is returned so a later
  * edit of the config object cannot mutate the running account. The
  * constructor and the config reload both come through here so a value refused
@@ -395,16 +401,22 @@ export function accountAdapterHeaders(acct) {
   }
   /** @type {Record<string, string>} */
   const out = {};
+  const seen = new Set();
   let dropped = 0;
   for (const [name, value] of Object.entries(raw)) {
-    if (!HEADER_NAME.test(name) || typeof value !== 'string' || /[\r\n]/.test(value)) {
+    // Header names are case-insensitive on the wire: a second entry differing
+    // only in case would silently evict the first at send time (server.js
+    // matches case-insensitively), so it is refused here instead.
+    const lower = name.toLowerCase();
+    if (seen.has(lower) || !HEADER_NAME.test(name) || typeof value !== 'string' || HEADER_VALUE.test(value)) {
       dropped++;
       continue;
     }
+    seen.add(lower);
     out[name] = value;
   }
   if (dropped) {
-    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${dropped} adapterHeaders ${dropped === 1 ? 'entry' : 'entries'} — names must be valid header names and values strings without CR/LF`);
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${dropped} adapterHeaders ${dropped === 1 ? 'entry' : 'entries'} — names must be valid header names, unique ignoring case, and values strings without control characters or code points beyond Latin-1`);
   }
   return Object.keys(out).length ? out : null;
 }

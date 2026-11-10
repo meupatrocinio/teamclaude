@@ -77,10 +77,17 @@ test('malformed adapterHeaders are dropped without failing account construction'
     entry({ id: 'c', name: 'c', adapterHeaders: { 'bad name': 'x', 'x-ok': 'fine' } }),
     entry({ id: 'd', name: 'd', adapterHeaders: { 'x-smuggle': 'one\r\nx-injected: two' } }),
     entry({ id: 'e', name: 'e', adapterHeaders: {} }),
+    entry({ id: 'f', name: 'f', adapterHeaders: { 'x-ctrl': 'a\x07b' } }),
+    entry({ id: 'g', name: 'g', adapterHeaders: { 'x-emoji': '\u{1F600}' } }),
+    entry({ id: 'h', name: 'h', adapterHeaders: { 'X-Dup': 'one', 'x-dup': 'two', 'x-ok': 'fine' } }),
   ], 0.98);
   assert.equal(am.accounts[0].adapterHeaders, null, 'an array is not a header set');
   assert.equal(am.accounts[1].adapterHeaders, null, 'a non-string value drops the set it would smuggle');
   assert.deepEqual(am.accounts[2].adapterHeaders, { 'x-ok': 'fine' }, 'an invalid name drops only its own entry');
   assert.equal(am.accounts[3].adapterHeaders, null, 'a CR/LF value is header injection');
   assert.equal(am.accounts[4].adapterHeaders, null, 'an empty set is no headers');
+  assert.equal(am.accounts[5].adapterHeaders, null, 'a control character throws ERR_INVALID_CHAR in Node\'s HTTP client');
+  assert.equal(am.accounts[6].adapterHeaders, null, 'a code point beyond Latin-1 throws the same');
+  assert.deepEqual(am.accounts[7].adapterHeaders, { 'X-Dup': 'one', 'x-ok': 'fine' },
+    'a case-variant duplicate would silently evict the first entry at send time');
 });
