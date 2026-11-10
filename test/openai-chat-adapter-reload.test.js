@@ -70,6 +70,16 @@ test('removing adapter fields on disk deletes their mirrors instead of resurrect
   }
 });
 
+test('reload keeps the malformed adapterHeaders text in config but drops it from the running account', async () => {
+  const invalid = { 'x-bridge-client-ip': 42 };
+  const startup = entry({ adapterHeaders: HEADERS });
+  const disk = entry({ adapterHeaders: invalid });
+  const { written, running, memConfig } = await roundTrip(startup, disk);
+  assert.equal(running.adapterHeaders, null, 'the invalid value must never reach the running account');
+  assert.deepEqual(memConfig.accounts[0].adapterHeaders, invalid, 'the mirror keeps the operator text as written');
+  assert.deepEqual(written.adapterHeaders, invalid, 'the save must not silently rewrite the operator text');
+});
+
 test('malformed adapterHeaders are dropped without failing account construction', () => {
   const am = new AccountManager([
     entry({ id: 'a', name: 'a', adapterHeaders: ['x-bridge-client-ip'] }),
