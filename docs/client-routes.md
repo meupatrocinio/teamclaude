@@ -56,7 +56,9 @@ tools and `getRoutes()` never see them.
 
 ## End-user identity upstream
 
-Every Anthropic-path request that carries a client key is stamped with a stable per-user tag in
+Every Anthropic inference request (`POST /v1/messages` served by an Anthropic account — not
+`count_tokens`, not `GET /v1/models`, and not an `openai-chat` account) that carries a client key
+is stamped with a stable per-user tag in
 `metadata.user_id` (`gateway_user: "u_<sha256 of the key name, 16 hex>"`), on any pool — routes or
 not. The key name is hashed because user_id must not carry PII, and the name — not the key — is
 what survives a re-mint. Claude Code's own `device_id`, session id and `account_uuid` pass through

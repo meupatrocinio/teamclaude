@@ -3957,7 +3957,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // headers and all, so a request bound to this seat gets upstream's own
     // answer until the window resets. For a bound request it is the answer now:
     // a spent seat will not come back inside any wait this proxy could hold.
-    const seatRejection = upstreamRes.status === 429 && providerOf(account) === DEFAULT_PROVIDER
+    // Never for a non-retryable 429: like the quota read above, that refusal is
+    // about the request, and an overall `rejected` with no rejected window
+    // would otherwise mark the model's bucket — a pinned request would get
+    // `spent` instead of upstream's own answer, and later requests would be
+    // blocked locally until the reset.
+    const seatRejection = upstreamRes.status === 429 && !nonRetryable429 && providerOf(account) === DEFAULT_PROVIDER
       ? recordSeatRejection(account, rateLimitHeaders, ctx.model, (/** @type {string|null} */ m) => accountManager._weeklyBucketFor(m))
       : null;
     if (seatRejection && ctx.bound) {

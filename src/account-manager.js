@@ -408,7 +408,10 @@ export function accountAdapterHeaders(acct) {
     // only in case would silently evict the first at send time (server.js
     // matches case-insensitively), so it is refused here instead.
     const lower = name.toLowerCase();
-    if (seen.has(lower) || !HEADER_NAME.test(name) || typeof value !== 'string' || HEADER_VALUE.test(value)) {
+    // `__proto__` is a legal RFC 7230 name but assigning it to a plain object
+    // runs the prototype setter, which ignores a string: the entry would vanish
+    // without a warning. Refuse it like any other malformed name.
+    if (name === '__proto__' || seen.has(lower) || !HEADER_NAME.test(name) || typeof value !== 'string' || HEADER_VALUE.test(value)) {
       dropped++;
       continue;
     }
@@ -5333,7 +5336,12 @@ export class AccountManager {
           const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
           const until = Date.now() + holdMs;
           account._refreshHeldUntil = until;
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
+          // An extreme Retry-After overflows Date's range; formatting it would
+          // throw RangeError here and reject the refresh handling even though
+          // the hold above already landed. Log the raw timestamp instead.
+          const untilDate = new Date(until);
+          const untilText = Number.isNaN(untilDate.getTime()) ? `timestamp ${until} ms` : untilDate.toISOString();
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${untilText}`);
         }
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {

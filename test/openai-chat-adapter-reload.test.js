@@ -80,6 +80,22 @@ test('reload keeps the malformed adapterHeaders text in config but drops it from
   assert.deepEqual(written.adapterHeaders, invalid, 'the save must not silently rewrite the operator text');
 });
 
+test('a __proto__ adapterHeaders entry is refused with a warning, never silently accepted', () => {
+  const origLog = console.log;
+  const lines = [];
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    // JSON.parse, not an object literal: a literal's __proto__ key invokes the
+    // prototype setter and never becomes an own property to iterate.
+    const am = new AccountManager([entry({ adapter: 'openai-chat', adapterHeaders: JSON.parse('{"__proto__":"10.0.0.1","x-ok":"fine"}') })], 0.98);
+    assert.deepEqual(am.accounts[0].adapterHeaders, { 'x-ok': 'fine' }, '__proto__ must not ride the running account');
+    assert.equal(Object.getPrototypeOf(am.accounts[0].adapterHeaders), Object.prototype, 'the surviving set is an ordinary object');
+  } finally {
+    console.log = origLog;
+  }
+  assert.ok(lines.some((l) => l.includes('adapterHeaders')), 'the refused entry must be announced, not dropped silently');
+});
+
 test('malformed adapterHeaders are dropped without failing account construction', () => {
   const am = new AccountManager([
     entry({ id: 'a', name: 'a', adapterHeaders: ['x-bridge-client-ip'] }),
