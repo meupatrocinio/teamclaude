@@ -123,8 +123,9 @@ function textContent(content, where) {
       || Object.keys(block).some(key => key !== 'type' && key !== 'text' && key !== 'cache_control')
       || (block.cache_control !== undefined && (!block.cache_control || typeof block.cache_control !== 'object'
         || Array.isArray(block.cache_control)
-        || Object.keys(block.cache_control).some(key => key !== 'type')
-        || block.cache_control.type !== 'ephemeral'))) {
+        || Object.keys(block.cache_control).some(key => key !== 'type' && key !== 'ttl')
+        || block.cache_control.type !== 'ephemeral'
+        || (block.cache_control.ttl !== undefined && block.cache_control.ttl !== '5m' && block.cache_control.ttl !== '1h')))) {
       const blockKeys = block && typeof block === 'object' && !Array.isArray(block) ? Object.keys(block).sort().join(',') : typeof block;
       const cacheType = block?.cache_control?.type ?? typeof block?.cache_control;
       const cacheKeys = block?.cache_control && typeof block.cache_control === 'object' && !Array.isArray(block.cache_control)
