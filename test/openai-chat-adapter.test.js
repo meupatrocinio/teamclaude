@@ -70,10 +70,10 @@ test('accepts text cache hints in order and omits them from OpenAI messages', ()
   const out = translated({
     system: [
       { type: 'text', text: 'one ' },
-      { type: 'text', text: 'two ', cache_control: { type: 'ephemeral' } },
-      { type: 'text', text: 'three', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'two ', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      { type: 'text', text: 'three', cache_control: { type: 'ephemeral', ttl: '5m' } },
     ],
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }] }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } }] }],
   });
   assert.equal(out.messages[0].content, 'one two three');
   assert.equal(out.messages[1].content, 'hello');
@@ -166,7 +166,8 @@ test('rejects tools, rich content and unsupported semantics before translation',
     { safeguards: [{ type: 'dangerous_tool_use' }] },
     { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] },
     { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'x' }] }] },
-    { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '2h' } }] },
+    { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', scope: 'user' } }] },
     { system: [{ type: 'text', text: 'x', cache_control: { type: 'persistent' } }] },
     { system: [{ type: 'text', text: 'x', cache_control: null }] },
     { model: 'claude-sonnet-4-6' },
@@ -178,7 +179,7 @@ test('reports safe structure for rejected system blocks without exposing text', 
   assert.throws(() => translated({
     system: [
       { type: 'text', text: 'valid' },
-      { type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      { type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '2h' } },
     ],
   }), error => {
     assert.match(error.message, /index=1/);

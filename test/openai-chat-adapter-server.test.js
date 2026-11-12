@@ -194,10 +194,10 @@ test('Claude Code text cache hints preserve plain text and never reach agy', asy
     const res = await ctx.post(request(false, {
       system: [
         { type: 'text', text: 'one ' },
-        { type: 'text', text: 'two ', cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: 'three', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'two ', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: 'three', cache_control: { type: 'ephemeral', ttl: '5m' } },
       ],
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }] }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } }] }],
     }));
     assert.equal(res.status, 200, res.body);
     assert.equal(ctx.agyRequests.length, 1);
@@ -239,7 +239,7 @@ test('unsupported requests and count_tokens are refused before either upstream',
       request(false, { thinking: { type: 'enabled' } }),
       request(false, { thinking: { type: 'adaptive', display: 'visible' } }),
       request(false, { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'none' }] } }),
-      request(false, { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }),
+      request(false, { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '2h' } }] }),
       request(false, { messages: [{ role: 'developer', content: 'x' }] }),
       request(false, { messages: [{ role: 'tool', content: 'x' }] }),
       request(false, { safeguards: [{ type: 'other_classifier', classifier_context: {} }] }),
@@ -249,7 +249,7 @@ test('unsupported requests and count_tokens are refused before either upstream',
       assert.equal(res.status, 400, res.body);
     }
     const diagnostic = await ctx.post(request(false, {
-      system: [{ type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      system: [{ type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '2h' } }],
     }));
     assert.equal(diagnostic.status, 400, diagnostic.body);
     assert.match(diagnostic.body, /index=0/);
@@ -455,7 +455,7 @@ for (const first of [MODEL, CLAUDE_MODEL]) {
           ...(model === MODEL ? {
             system: [
               { type: 'text', text: 'system one ' },
-              { type: 'text', text: 'system two', cache_control: { type: 'ephemeral' } },
+              { type: 'text', text: 'system two', cache_control: { type: 'ephemeral', ttl: '1h' } },
             ],
             tools: [],
             thinking: { type: 'adaptive', display: 'updates' },
