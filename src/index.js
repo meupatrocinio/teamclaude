@@ -33,6 +33,7 @@ import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
+import { ClaudeReauthFlows } from './claude-reauth.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
@@ -878,6 +879,9 @@ async function serverCommand() {
   const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, pending: savedState?.claudeResetPending, updateStateFn: updateState });
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
   hooks.redeemClaudeReset = (/** @type {number} */ index) => claudeRedeemer.redeemAccount(accountManager.accounts[index]);
+  const claudeReauthFlows = new ClaudeReauthFlows();
+  hooks.startClaudeReauth = (/** @type {number} */ index) => claudeReauthFlows.start(accountManager.accounts[index]);
+  hooks.completeClaudeReauth = (/** @type {string} */ flowId, /** @type {string} */ code) => claudeReauthFlows.complete(flowId, code);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's

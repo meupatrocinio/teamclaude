@@ -219,3 +219,28 @@ export function oauthIdentityFields(profile) {
       .map(key => [key, profile[key]])
   );
 }
+
+/** The identity a console-approved credential replacement must match exactly. */
+export function renderedReauthIdentity(account) {
+  if (account?.type !== 'oauth' || providerOf(account) !== 'anthropic') {
+    const err = /** @type {import('./types.js').CodedError} */ (new Error('only an Anthropic OAuth account can be re-authenticated'));
+    err.code = 'not_anthropic_oauth';
+    err.status = 409;
+    throw err;
+  }
+  if (typeof account.accountUuid !== 'string' || !account.accountUuid
+    || typeof account.orgUuid !== 'string' || !account.orgUuid) {
+    const err = /** @type {import('./types.js').CodedError} */ (new Error('the rendered account and organization UUIDs are unknown'));
+    err.code = 'identity_unproven';
+    err.status = 409;
+    throw err;
+  }
+  return { accountUuid: account.accountUuid, orgUuid: account.orgUuid };
+}
+
+/** Unlike sameIdentity, unknown fields and name/email equality never pass. */
+export function exactReauthIdentity(expected, actual) {
+  return Boolean(expected && actual && !actual.error
+    && typeof actual.accountUuid === 'string' && actual.accountUuid === expected.accountUuid
+    && typeof actual.orgUuid === 'string' && actual.orgUuid === expected.orgUuid);
+}
