@@ -1,9 +1,9 @@
 import http from 'node:http';
 import https from 'node:https';
-import { timingSafeEqual } from 'node:crypto';
-import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { chmodSync, createWriteStream, existsSync, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
@@ -13,6 +13,7 @@ import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-w
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { stampGatewayUser } from './user-identity.js';
 import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus, norm } from './client-routes.js';
+import { createContinuationTelemetry } from './continuation-telemetry.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
@@ -510,6 +511,35 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   }
 
+  // Continuation-attempt telemetry (AI-1959): one durable JSONL line per
+  // continuation-selected sibling send, written before the send. Off unless
+  // config.continuationAttemptsLog names a path. The parent directory is made
+  // up front, like logDir — 0755 rather than 0700 so the console container
+  // can traverse to the per-event chmod'd 0644 file — and a failure disables
+  // the feature with a seeded open_failed status instead of failing every
+  // send. Never fatal: a broken log path is no reason to refuse traffic.
+  let continuationTelemetry = createContinuationTelemetry();
+  const continuationAttemptsLog = typeof config.continuationAttemptsLog === 'string' && config.continuationAttemptsLog
+    ? config.continuationAttemptsLog
+    : null;
+  if (continuationAttemptsLog) {
+    try {
+      const attemptsLogDir = dirname(continuationAttemptsLog);
+      const dirExisted = existsSync(attemptsLogDir);
+      mkdirSync(attemptsLogDir, { recursive: true, mode: 0o755 });
+      // mkdir's mode is umask-masked (under umask 077 the directory would land
+      // 0700 and the console container could not traverse to the 0644 file),
+      // so a directory WE created is chmod'd like the per-event file chmod. A
+      // pre-existing directory's permissions stay untouched.
+      if (!dirExisted) chmodSync(attemptsLogDir, 0o755);
+      continuationTelemetry = createContinuationTelemetry({ path: continuationAttemptsLog });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(`[TeamClaude] Continuation-attempt logging disabled: cannot create the directory for ${continuationAttemptsLog}: ${detail}`);
+      continuationTelemetry = createContinuationTelemetry({ path: continuationAttemptsLog, disabled: true });
+    }
+  }
+
   const requestHandler = async (req, res) => {
     try {
       // The control plane answers to its new name as well (issue #72): a URL
@@ -670,6 +700,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           continuationPolicies: policyStatus.policies,
           continuationPolicyErrors: policyStatus.errors,
           continuationPolicyLoadError: policyStatus.loadError,
+          // AI-1959: the attempt-log writer's counters are admin-only like the
+          // policy list beside them; a client key never sees them.
+          continuationTelemetry: continuationTelemetry.status(),
         };
         const callerPolicy = req.tcClient ? callerContinuationPolicy(policyTable, req.tcClient, req.tcKeyHash ?? null) : undefined;
         res.end(JSON.stringify({
@@ -1248,7 +1281,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, continuationTelemetry });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1290,7 +1323,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, continuationTelemetry }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -1759,8 +1792,9 @@ export function clientSessionId(headers) {
  * @param {string|null} [opts.forcedClient]
  * @param {string|null} [opts.forcedKeyHash]  the CONNECT-time key hash (AI-1903, E10): tunnelled requests never re-authenticate, so the MITM listener carries it for owner-root matching
  * @param {Object|null} [opts.dimensionUsage]
+ * @param {ReturnType<typeof createContinuationTelemetry>|null} [opts.continuationTelemetry]  the AI-1959 attempt-log writer, shared with the status endpoint; null/omitted = continuation events are dropped
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, forcedKeyHash = null, dimensionUsage = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, forcedKeyHash = null, dimensionUsage = null, continuationTelemetry = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -2181,10 +2215,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // offer-scope reference derived from it, the cg contract gate for the
         // 429 copy, the live proxy config for the per-hop key re-check (E11),
         // and the armed force-hop count (capped at MAX_CONTINUATION_HOPS).
+        // keyRef (owner amendment, AI-1959, 2026-11-13) is set for EVERY
+        // client-key request, root or legacy — requestKeyHash is non-null
+        // exactly for a client-key authentication, so keyRef is null only for
+        // the admin or shared key.
         continuationPolicy, keyHash: requestKeyHash,
-        keyRef: continuationPolicy?.source === 'root' && requestKeyHash ? offerKeyRef(requestKeyHash) : null,
+        keyRef: requestKeyHash ? offerKeyRef(requestKeyHash) : null,
         cgContractRoot: req.headers['x-teamclaude-cg-contract'] === 'root-v1',
-        proxyConfig, continuationHops: 0 };
+        proxyConfig, continuationHops: 0, continuationTelemetry };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3574,6 +3612,12 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
     coldCache: true,
     policy: 'force',
   };
+  // AI-1959: the durable attempt event is recorded at the send point, not
+  // here — hop arming runs before the pre-send re-checks (entitlement, cap,
+  // adapter), and a hop whose send never happens must leave no trace.
+  // forwardRequest consumes this marker immediately before upstreamFetch when
+  // the attempt's account is the destination named here.
+  ctx.pendingContinuationEvent = { mode: 'force', hop: ctx.continuationHops, from: account.name, to: destination.name };
   console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
   return true;
 }
@@ -3685,6 +3729,12 @@ function pickBoundAccount(accountManager, ctx) {
             const destination = accountManager.accounts[next];
             ctx.tried.add(pinIdx);
             ctx.seatContinuation = { from: pinned.name, to: destination.name, coldCache: true };
+            // AI-1959: consumed at the send point, like the force-hop marker
+            // in hopForcedSeat. hop is continuationHops + 1 — always 1 in
+            // practice: this branch fires once per request
+            // (ctx.seatContinuationChecked) and only while the pinned account
+            // is still untried, strictly before any force hop can be armed.
+            ctx.pendingContinuationEvent = { mode: 'recommend', hop: (ctx.continuationHops ?? 0) + 1, from: pinned.name, to: destination.name };
             return destination;
           }
         }
@@ -3749,6 +3799,9 @@ function openAIChatUpstreamUrl(account, configuredUpstream) {
   url.search = '';
   return url.toString();
 }
+
+/** AI-1959: one continuation-event field, length-bound at build time so the JSONL line stays well under 4 KiB. */
+const continuationEventField = (/** @type {unknown} */ v) => String(v ?? '').slice(0, 128);
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
@@ -3817,6 +3870,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         : accountManager.getActiveAccount(
           ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
         );
+  // AI-1959: an armed continuation whose destination is not THIS attempt's
+  // account was abandoned before its send (a pre-send re-check moved the
+  // request on, or the seat answered without one) — the stale marker is
+  // dropped and leaves no trace.
+  if (ctx.pendingContinuationEvent && ctx.pendingContinuationEvent.to !== account?.name) {
+    ctx.pendingContinuationEvent = null;
+  }
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
   if (selection.rolledOff) {
@@ -4267,6 +4327,33 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
+    // AI-1959: this attempt IS the continuation the marker names — record the
+    // durable attempt event now, immediately before the send, with durability
+    // (open/chmod/write/fsync/close) completed inside record(), so a
+    // destination that fails mid-stream still left its trace. After every
+    // pre-send bail-out above, so an armed-but-never-sent hop writes nothing.
+    // record() never throws: a failed write flips the telemetry status and
+    // the send proceeds.
+    if (ctx.pendingContinuationEvent && ctx.pendingContinuationEvent.to === account.name) {
+      const pending = ctx.pendingContinuationEvent;
+      ctx.pendingContinuationEvent = null;
+      await ctx.continuationTelemetry?.record({
+        v: 1,
+        type: 'attempt',
+        id: randomUUID(),
+        at: new Date().toISOString(),
+        client: continuationEventField(norm(ctx.client)),
+        keyRef: ctx.keyRef ?? null,
+        revision: ctx.continuationPolicy?.revision ?? null,
+        mode: pending.mode,
+        source: ctx.continuationPolicy?.source ?? 'legacy',
+        requestId: String(reqId),
+        hop: pending.hop,
+        from: continuationEventField(pending.from),
+        to: continuationEventField(pending.to),
+        model: continuationEventField(ctx.model),
+      });
     }
     let upstreamRes;
     let admittedLoad = 0;

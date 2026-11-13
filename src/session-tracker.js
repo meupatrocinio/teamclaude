@@ -544,8 +544,10 @@ export class SessionTracker {
    * pin against which a later request could safely consume the offer.
    *
    * The map key stays `${client}\0${route}\0${bucket}` for every caller; the
-   * root revision and keyRef ride on the record and are compared on take, so a
-   * legacy offer keeps its pre-AI-1903 shape exactly.
+   * root revision and keyRef ride on the record and are compared on take.
+   * Since the AI-1959 owner amendment a legacy offer from a client-key request
+   * records a non-null keyRef too (null only for the admin or shared key), so
+   * the take stays fail-closed on a key rotation.
    * @param {string|null} sessionId
    * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number, revision?: string|null, keyRef?: string|null}} scope
    * @param {number} [now]

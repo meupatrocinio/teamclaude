@@ -27,6 +27,7 @@
     }
   ],
   "continuationPolicyErrors": [],
+  "continuationAttemptsLog": null,
   "distributeSessions": false,
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
