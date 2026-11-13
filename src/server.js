@@ -434,6 +434,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/claude-reset', 'a client key cannot redeem Claude resets'],
+  ['/teamclaude/claude-reauth/start', 'a client key cannot acquire seat credentials'],
+  ['/teamclaude/claude-reauth/complete', 'a client key cannot acquire seat credentials'],
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
@@ -465,6 +467,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
 export function callerView(client, seat, continuationPolicy) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()], ...(seat !== undefined ? { seat } : {}), ...(continuationPolicy !== undefined ? { continuationPolicy } : {}) };
+}
+
+function answerReauthFailure(res, err) {
+  const status = [400, 403, 404, 409, 429, 500, 502, 504].includes(err?.status) ? err.status : 502;
+  const code = typeof err?.code === 'string' && /^[a-z_]{1,48}$/.test(err.code) ? err.code : 'oauth_failed';
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify({ ok: false, reason: code }));
 }
 
 /**
@@ -783,6 +792,94 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Manual Claude reset failed without a safe upstream verdict');
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, outcome: 'unknown', reason: 'reset operation failed', mayHaveRedeemed: true }));
+        }
+        return;
+      }
+
+      // Manual PKCE for an approved console-owned credential replacement. These
+      // routes only acquire and validate a bundle in memory; they never upsert an
+      // account, write the config, reload the proxy, or redeem a reset.
+      if (req.method === 'POST' && (req.url === '/teamclaude/claude-reauth/start' || req.url === '/teamclaude/claude-reauth/complete')) {
+        const starting = req.url === '/teamclaude/claude-reauth/start';
+        const keylessRefusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost());
+        if (keylessRefusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, reason: 'keyless_remote_refused' }));
+          return;
+        }
+        const hook = starting ? hooks.startClaudeReauth : hooks.completeClaudeReauth;
+        if (!hook) {
+          res.writeHead(501, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, reason: 'not_supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse((await readControlBody(req)) || '{}');
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, reason: tooLarge ? 'body_too_large' : 'invalid_body' }));
+          return;
+        }
+        const allowed = starting ? ['account'] : ['flowId', 'code'];
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).some(key => !allowed.includes(key))) {
+          res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, reason: starting ? 'only_account_allowed' : 'only_flow_and_code_allowed' }));
+          return;
+        }
+        try {
+          if (starting) {
+            if (typeof body.account !== 'string' || !body.account.trim()) {
+              res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+              res.end(JSON.stringify({ ok: false, reason: 'missing_account' }));
+              return;
+            }
+            const resolved = resolveUniqueAccountPin(accountManager, body.account.trim());
+            if (resolved.index == null) {
+              res.writeHead(resolved.error === 'ambiguous' ? 409 : 404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+              res.end(JSON.stringify({ ok: false, reason: resolved.error === 'ambiguous' ? 'ambiguous_account' : 'unknown_account' }));
+              return;
+            }
+            const r = await hook(resolved.index);
+            if (typeof r?.flowId !== 'string' || typeof r?.authorizationUrl !== 'string'
+              || typeof r?.identity?.accountUuid !== 'string' || typeof r?.identity?.orgUuid !== 'string') {
+              throw new Error('invalid OAuth start result');
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({
+              ok: true,
+              flowId: r.flowId,
+              authorizationUrl: r.authorizationUrl,
+              identity: { accountUuid: r.identity.accountUuid, orgUuid: r.identity.orgUuid },
+            }));
+            return;
+          }
+          if (typeof body.flowId !== 'string' || !body.flowId || typeof body.code !== 'string' || !body.code) {
+            res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok: false, reason: 'missing_flow_or_code' }));
+            return;
+          }
+          const r = await hook(body.flowId, body.code);
+          if (typeof r?.credentials?.accessToken !== 'string' || !r.credentials.accessToken
+            || typeof r?.credentials?.refreshToken !== 'string' || !r.credentials.refreshToken
+            || !Number.isFinite(r?.credentials?.expiresAt)
+            || typeof r?.identity?.accountUuid !== 'string' || typeof r?.identity?.orgUuid !== 'string') {
+            throw new Error('invalid OAuth completion result');
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({
+            ok: true,
+            credentials: {
+              accessToken: r.credentials.accessToken,
+              refreshToken: r.credentials.refreshToken,
+              expiresAt: r.credentials.expiresAt,
+            },
+            identity: { accountUuid: r.identity.accountUuid, orgUuid: r.identity.orgUuid },
+          }));
+        } catch (err) {
+          answerReauthFailure(res, err);
         }
         return;
       }
