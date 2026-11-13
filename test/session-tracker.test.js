@@ -514,10 +514,13 @@ test('a refusal that can only name the session reaches every conversation of it'
   assert.equal(st.recordOutcomeForSession(null, false, clock.t), 0);
 });
 
-test('an over-long pin key is keyed by its first MAX_KEY_LENGTH characters', () => {
+test('an over-long CLIENT pin key is keyed by its first MAX_KEY_LENGTH characters', () => {
   // The bound covers a session id AND the conversation digest appended to it,
   // so a key the request path produced is never truncated; only one a client
-  // forged past the length server.js admits is.
+  // forged past the length server.js admits is. AI-1960: the internally
+  // generated worker-scope shape (`w:<32hex>` NUL <legacy pin>) is the one
+  // exemption — it is un-spoofable by a client and hard-capped at 253 chars,
+  // and truncating it would collide two distinct worker scopes onto one record.
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });
   const base = 'x'.repeat(MAX_KEY_LENGTH);
@@ -532,6 +535,32 @@ test('an over-long pin key is keyed by its first MAX_KEY_LENGTH characters', () 
   assert.equal(st.sessions.get(base).inFlight, 0);
   assert.deepEqual(st.pinnedAccounts(base + '-tail-four', clock.t), [3]);
   assert.equal(st.sessions.size, 1);
+});
+
+test('the internal worker-scope shape bypasses truncation up to 253 chars, never beyond', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const scope = 'w:' + 'a'.repeat(32) + '\0';
+  const legacy = 'y'.repeat(MAX_KEY_LENGTH);
+  const full = scope + legacy + '-beyond-151';  // 186 + more, under 253
+  assert.ok(full.length > MAX_KEY_LENGTH && full.length <= 253);
+  st.touch(full, 4, SHARED, clock.t);
+  assert.equal(st.sessions.has(full), true, 'the internal key is stored whole');
+  assert.equal(st.pinnedAccount(full, SHARED, clock.t), 4);
+  // A differently-tailed scope is a DIFFERENT record — no truncation collision.
+  const other = scope + legacy + '-beyond-151-X';
+  assert.equal(st.pinnedAccount(other, SHARED, clock.t), null);
+  // Past 253 even the internal shape truncates (to the client bound).
+  const over253 = scope + 'z'.repeat(300);
+  st.touch(over253, 5, SHARED, clock.t);
+  assert.equal(st.sessions.has(over253), false);
+  assert.equal(st.sessions.has(over253.slice(0, MAX_KEY_LENGTH)), true);
+  // And a client-spellable lookalike (no NUL, client alphabet only) truncates
+  // at 151 like any other client key.
+  const lookalike = 'w:' + 'a'.repeat(32) + '/' + 'q'.repeat(200);
+  st.touch(lookalike, 6, SHARED, clock.t);
+  assert.equal(st.sessions.has(lookalike), false);
+  assert.equal(st.sessions.has(lookalike.slice(0, MAX_KEY_LENGTH)), true);
 });
 
 test('beginRequest sweeps expired sessions on the same throttle as touch', () => {

@@ -2144,31 +2144,48 @@ export class AccountManager {
    * that family, and only selection knows which. Claiming it here on a request
    * that was degraded would pin a family to an account that never served it,
    * quite possibly one that cannot. Unclaimed means the session routes that
-   * family afresh next request, which is what it did before it had a pin. */
-  recordSession(sessionId, accountIndex, model = null) {
+   * family afresh next request, which is what it did before it had a pin.
+   *
+   * `opts.bucket` / `opts.seq` (AI-1960): the request path passes the weekly
+   * bucket fixed on the ctx at admission (E21) and the per-bucket pin sequence
+   * allocated there (E12), so a mid-request reload cannot re-bucket the write
+   * and a stale request cannot re-pin. `seq: null` (a non-completion that
+   * reached routing, e.g. count_tokens) records the visit but writes no pin.
+   * Omitting both is the legacy behavior: the bucket is recomputed from
+   * `model` and the pin write is unsequenced — what the direct callers in
+   * tests do. */
+  recordSession(sessionId, accountIndex, model = null, { bucket = null, seq = undefined } = {}) {
     if (!sessionId) return;
-    const bucket = this._weeklyBucketFor(model);
+    const b = bucket ?? this._weeklyBucketFor(model);
     // The pin alone: this runs before the destination's token is refreshed and
     // long before the upstream fetch, so it names where the request is being
     // SENT, and being sent somewhere is not arriving there. The observation is
     // taken where the evidence is, at the start of the NEXT request from
     // wherever this one left the pin (see _restOn).
-    this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    this.sessionTracker.touch(sessionId, accountIndex, b, undefined, seq);
     // The load mode's input: one entry per routed request that carries a
     // session id, in every mode, so switching to load starts from a warm picture.
     this.sessionTracker.noteRouted(accountIndex);
     // Except the FIRST one, which discards nothing: otherwise a session's
     // opening window is first-sighted a request late (see _firstSightOn).
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true),
+    this._firstSightOn(this.sessionTracker.refsFor(sessionId, b, true),
       this.accounts[accountIndex]);
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
    * client request (including retries) so a long streaming completion keeps the
-   * session counted as active for its full duration. */
-  beginSession(sessionId, metadata = null) {
-    if (sessionId) this.sessionTracker.beginRequest(sessionId, undefined, metadata);
+   * session counted as active for its full duration.
+   *
+   * `bucket` (AI-1960): the admission-fixed weekly bucket of a COMPLETION
+   * request. When given, the per-bucket pin sequence is allocated here — after
+   * the in-flight hold is taken — and returned; the request carries it on its
+   * ctx for the whole run, retries and hops included. Null (a non-completion
+   * path, E12) allocates nothing and returns null. */
+  beginSession(sessionId, metadata = null, bucket = null) {
+    if (!sessionId) return null;
+    this.sessionTracker.beginRequest(sessionId, undefined, metadata);
+    return bucket ? this.sessionTracker.allocatePinSeq(sessionId, bucket) : null;
   }
 
   /**
