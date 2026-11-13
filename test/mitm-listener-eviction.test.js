@@ -37,7 +37,7 @@ async function setup() {
   const handler = createConnectHandler({ config, accountManager: am, ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }), log: () => {} });
   proxy.on('connect', handler);
   const proxyPort = await listen(proxy);
-  return { proxy, handler, proxyPort, upPort, upstream, caCertPem };
+  return { proxy, handler, proxyPort, upPort, upstream, caCertPem, config };
 }
 
 // Open a CONNECT tunnel and keep the raw socket open (no TLS handshake needed:
@@ -93,19 +93,22 @@ test('a key rotation evicts the stale listener and destroys its held-open tunnel
 });
 
 test('N rotations leave the memo bounded', T, async () => {
-  const { proxy, handler, proxyPort, upPort, upstream } = await setup();
+  const { proxy, handler, proxyPort, upPort, upstream, config } = await setup();
   const tunnels = [];
   try {
     const target = `127.0.0.1:${upPort}`;
-    let current = ['ana-key'];
     for (let i = 0; i < 8; i++) {
       const key = `ana-key-v${i}`;
+      // The rotation swap on the LIVE config comes first: the CONNECT below
+      // must authenticate with the current key, or it falls through to the
+      // loopback exemption (client null, keyHash null) and lands on the exempt
+      // empty-keyHash entry — one memo entry no matter what the evictor does,
+      // and this test would pass with the evictor deleted.
+      config.proxy.clientKeys = [{ name: 'ana', key }];
       tunnels.push(await openTunnel(proxyPort, target, basic(`:${key}`)));
-      // The rotation swap: only the newest key is valid afterwards.
-      handler.evictStaleTunnels({ apiKey: 'admin-key', clientKeys: [{ name: 'ana', key }] });
-      current = [key];
-      assert.ok(handler.tunnelListenerCount() <= current.length + 1,
-        `after rotation ${i}: ${handler.tunnelListenerCount()} listeners for ${JSON.stringify(current)}`);
+      handler.evictStaleTunnels(config.proxy);
+      assert.equal(handler.tunnelListenerCount(), 1,
+        `after rotation ${i}: ${handler.tunnelListenerCount()} listeners, expected only the live key's`);
     }
     assert.equal(handler.tunnelListenerCount(), 1, 'only the live key\'s listener remains');
   } finally {

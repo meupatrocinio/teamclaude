@@ -542,8 +542,18 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const mapKey = `${pin || ''}\0${auth.client || ''}\0${auth.keyHash ?? ''}`;
     getServer(pin || '', auth.client, auth.keyHash ?? null).then((srv) => {
       // A reload may have evicted this entry while the mint was in flight: its
-      // keyHash is gone, so this tunnel must not be tracked or served.
-      if (!serverPromises.has(mapKey)) { clientSocket.destroy(); return; }
+      // keyHash is gone, so this tunnel must not be tracked or served. Answer
+      // like the auth gate above rather than bare-destroying — a reset with no
+      // CONNECT status line is reported by clients as "Proxy connection ended
+      // before receiving CONNECT response", while a 407 tells the client to
+      // re-authenticate (with its new key) and retry.
+      if (!serverPromises.has(mapKey)) {
+        try {
+          clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
+        } catch { /* client already gone */ }
+        clientSocket.destroy();
+        return;
+      }
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       // Track the tunnel against its memo entry (see tunnelSockets above) so
