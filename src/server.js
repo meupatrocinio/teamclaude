@@ -525,13 +525,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   if (continuationAttemptsLog) {
     try {
       const attemptsLogDir = dirname(continuationAttemptsLog);
-      const dirExisted = existsSync(attemptsLogDir);
+      // mkdir's mode is umask-masked (under umask 077 a created directory
+      // lands 0700 and the console container cannot traverse it to the 0644
+      // file), so every level WE create is chmod'd like the per-event file
+      // chmod — every level, not just the leaf: a recursive mkdir of a
+      // multi-level path would otherwise leave an intermediate 0700 directory
+      // blocking the way. A pre-existing directory's permissions stay
+      // untouched.
+      const createdDirs = [];
+      for (let d = attemptsLogDir; !existsSync(d);) {
+        createdDirs.push(d);
+        const parent = dirname(d);
+        if (parent === d) break;
+        d = parent;
+      }
       mkdirSync(attemptsLogDir, { recursive: true, mode: 0o755 });
-      // mkdir's mode is umask-masked (under umask 077 the directory would land
-      // 0700 and the console container could not traverse to the 0644 file),
-      // so a directory WE created is chmod'd like the per-event file chmod. A
-      // pre-existing directory's permissions stay untouched.
-      if (!dirExisted) chmodSync(attemptsLogDir, 0o755);
+      for (const d of createdDirs) chmodSync(d, 0o755);
       continuationTelemetry = createContinuationTelemetry({ path: continuationAttemptsLog });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -3616,8 +3625,10 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
   // here — hop arming runs before the pre-send re-checks (entitlement, cap,
   // adapter), and a hop whose send never happens must leave no trace.
   // forwardRequest consumes this marker immediately before upstreamFetch when
-  // the attempt's account is the destination named here.
-  ctx.pendingContinuationEvent = { mode: 'force', hop: ctx.continuationHops, from: account.name, to: destination.name };
+  // the attempt's account is the destination named here; the event's hop
+  // number is assigned there too, so it numbers continuation SENDS, not
+  // armings (an armed-but-never-sent hop leaves no gap and no collision).
+  ctx.pendingContinuationEvent = { mode: 'force', from: account.name, to: destination.name };
   console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
   return true;
 }
@@ -3730,11 +3741,12 @@ function pickBoundAccount(accountManager, ctx) {
             ctx.tried.add(pinIdx);
             ctx.seatContinuation = { from: pinned.name, to: destination.name, coldCache: true };
             // AI-1959: consumed at the send point, like the force-hop marker
-            // in hopForcedSeat. hop is continuationHops + 1 — always 1 in
-            // practice: this branch fires once per request
-            // (ctx.seatContinuationChecked) and only while the pinned account
-            // is still untried, strictly before any force hop can be armed.
-            ctx.pendingContinuationEvent = { mode: 'recommend', hop: (ctx.continuationHops ?? 0) + 1, from: pinned.name, to: destination.name };
+            // in hopForcedSeat; the hop number is assigned there (the count of
+            // continuation sends this request has made), so a recommend hop
+            // followed by a force hop under a mixed-policy seat numbers 1, 2 —
+            // not 1, 1, as arming-time numbering off continuationHops gave
+            // (the recommend path never increments it).
+            ctx.pendingContinuationEvent = { mode: 'recommend', from: pinned.name, to: destination.name };
             return destination;
           }
         }
@@ -4349,7 +4361,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         mode: pending.mode,
         source: ctx.continuationPolicy?.source ?? 'legacy',
         requestId: String(reqId),
-        hop: pending.hop,
+        // The Nth continuation SEND of this request, numbered here so armed-
+        // but-never-sent hops leave no gap and the two arming modes cannot
+        // collide on the same number under one requestId.
+        hop: (ctx.continuationSeq = (ctx.continuationSeq ?? 0) + 1),
         from: continuationEventField(pending.from),
         to: continuationEventField(pending.to),
         model: continuationEventField(ctx.model),

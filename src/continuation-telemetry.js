@@ -26,6 +26,7 @@
 // path via O_CREAT on the next event. Node 20+ built-ins only.
 
 import fs from 'node:fs';
+import { dirname } from 'node:path';
 
 /**
  * The telemetry status surfaced as `continuationTelemetry` on
@@ -79,6 +80,11 @@ export function createContinuationTelemetry({ path = null, open = fs.promises.op
      */
     async record(event) {
       if (!enabled || target == null) return;
+      // Whether the path already exists, sampled before the open: a file this
+      // event CREATEs (first event, or the first after a rotation) is not
+      // crash-durable from the file fsync alone — the directory entry needs
+      // its own sync, done best-effort after the write below.
+      const preExisting = fs.existsSync(target);
       /** @type {fs.promises.FileHandle|null} */
       let handle = null;
       try {
@@ -102,14 +108,28 @@ export function createContinuationTelemetry({ path = null, open = fs.promises.op
       }
       // One single write per event is the contract, so a short write is never
       // retried — but fsyncing a truncated, unparseable line must not count
-      // as success either.
+      // as success either. The partial bytes are rolled back first: left in
+      // place they carry no newline, so the NEXT event's line would append
+      // onto the fragment and one short write would silently cost two events.
       if (written !== Buffer.byteLength(line)) {
+        // Best-effort, and guarded: a handle without stat/truncate (or a
+        // rollback failure) must not break the never-rejects contract.
+        if (written > 0) {
+          try { await handle.truncate((await handle.stat()).size - written); } catch { /* the fragment stays; the status still names the failure */ }
+        }
         fail('write_failed');
         await handle.close().catch(() => {});
         return;
       }
       try {
         await handle.sync();
+        // New directory entry: sync the parent too, or a power loss can still
+        // lose the just-created, just-fsynced file. Best-effort — the line
+        // itself is already durable, and no status class names this failure.
+        if (!preExisting) {
+          const dir = await fs.promises.open(dirname(target)).catch(() => null);
+          if (dir) { await dir.sync().catch(() => {}); await dir.close().catch(() => {}); }
+        }
       } catch {
         fail('fsync_failed');
         await handle.close().catch(() => {});

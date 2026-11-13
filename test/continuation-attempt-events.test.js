@@ -237,6 +237,42 @@ test('writer: a short write classifies as write_failed — never fsynced, never 
   }
 });
 
+test('writer: a short write is rolled back so the next event is not glued to the newline-less fragment', async () => {
+  const dir = tmpdir();
+  try {
+    const logPath = join(dir, 'attempts.jsonl');
+    let short = true;
+    const realOpen = fs.promises.open;
+    const open = async (...args) => {
+      const h = await realOpen(...args);
+      if (!short) return h;
+      // A real file, a real 2-byte write, a short report — then the rollback
+      // under test must truncate those 2 bytes back off.
+      return {
+        chmod: (...a) => h.chmod(...a),
+        write: async (s) => {
+          const frag = Buffer.from(s).subarray(0, 2);
+          await h.write(frag);
+          return { bytesWritten: 2, buffer: frag };
+        },
+        stat: () => h.stat(),
+        truncate: (n) => h.truncate(n),
+        sync: () => h.sync(),
+        close: () => h.close(),
+      };
+    };
+    const t = createContinuationTelemetry({ path: logPath, open });
+    await t.record({ v: 1, n: 'short' });
+    assert.equal(t.status().lastError, 'write_failed');
+    short = false;
+    await t.record({ v: 1, n: 'full' });
+    assert.equal(t.status().ok, true);
+    assert.deepEqual(readEvents(logPath), [{ v: 1, n: 'full' }], 'no glued, unparseable second line');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('writer: the last error stays sticky across a later success', async () => {
   const dir = tmpdir();
   try {
@@ -459,6 +495,38 @@ test('RECOMMEND_TAKEN: a taken offer records one recommend event with hop 1', as
       assert.equal(ev.source, 'root');
       assert.equal(ev.revision, 'r_rec');
       assert.equal(ev.keyRef, offerKeyRef(keyHashOf('amy-key')));
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('RECOMMEND_THEN_FORCE: a taken recommend hop followed by a force hop numbers the sends 1, 2 — never 1, 1', async () => {
+  const dir = tmpdir();
+  try {
+    const logPath = join(dir, 'attempts.jsonl');
+    let qaSpent = false;
+    await withGateway({
+      attemptsLog: logPath,
+      // s1 (qa) recommend, s2/s3 (qb/qc) force: the offer lands on qb, qb's
+      // own 429 then force-hops to qc inside the same request.
+      handler: (who, _req, res) => ((who === 'qa' && qaSpent) || who === 'qb' ? spent(res) : ok(res)),
+    }, async ({ send, seen }) => {
+      const policy = 's1=recommend,s2=force,s3=force';
+      assert.equal((await send({ policy })).status, 200);
+      qaSpent = true;
+      assert.equal((await send({ policy })).status, 429, 'recommend discloses the offer, nothing sent to a sibling');
+      assert.equal(readEvents(logPath).length, 0);
+      assert.equal((await send({ policy })).status, 200, 'offer taken to qb; qb spent upstream; force hop on to qc');
+      assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qc']);
+      const events = readEvents(logPath);
+      assert.deepEqual(events.map((e) => [e.mode, e.hop, e.from, e.to]), [
+        ['recommend', 1, 'qa', 'qb'],
+        // Arming-time numbering off continuationHops (which the recommend path
+        // never increments) would call this hop 1 too — a (requestId, hop)
+        // collision. Send-time numbering keeps it 2.
+        ['force', 2, 'qb', 'qc'],
+      ]);
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -692,6 +760,22 @@ test('startup: a log directory created under umask 0o077 is chmod 0755 so the co
       assert.equal((await send()).status, 200);
     });
     assert.equal(fs.statSync(join(dir, 'fresh-subdir')).mode & 0o777, 0o755, 'the created directory is traversable despite the umask');
+  } finally {
+    process.umask(oldUmask);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('startup: EVERY created level of a multi-level log directory is chmod 0755, not just the leaf', async () => {
+  const dir = tmpdir();
+  const oldUmask = process.umask(0o077);
+  try {
+    const logPath = join(dir, 'level-one', 'level-two', 'attempts.jsonl');
+    await withGateway({ attemptsLog: logPath }, async ({ send }) => {
+      assert.equal((await send()).status, 200);
+    });
+    assert.equal(fs.statSync(join(dir, 'level-one')).mode & 0o777, 0o755, 'an intermediate created directory is traversable too — a leaf-only chmod would leave it 0700 under this umask');
+    assert.equal(fs.statSync(join(dir, 'level-one', 'level-two')).mode & 0o777, 0o755);
   } finally {
     process.umask(oldUmask);
     fs.rmSync(dir, { recursive: true, force: true });
