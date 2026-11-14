@@ -573,6 +573,12 @@ async function serverCommand() {
     // key add/rotate/revoke needs — no restart).
     if (config.proxy && diskConfig.proxy) {
       config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      // AI-1960 (the AI-1903 review fix): drop MITM tunnel listeners memoized
+      // under a keyHash this swap just removed, in the SAME synchronous stretch
+      // as the swap — no await runs between the two, so no request can
+      // authenticate against a half-updated set. Exposed by the server below;
+      // absent only in embeddings that never created one.
+      hooks.evictStaleMitmTunnels?.(config.proxy);
       // Dimensions are resolved per request from this same object, so a
       // reload adds or drops one without a restart.
       config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
@@ -949,6 +955,9 @@ async function serverCommand() {
     await ensureCerts(mitmHosts(config)).catch((err) => console.error(`[TeamClaude] Could not renew the MITM certificate: ${err.message}`));
   }
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
+  // AI-1960: the MITM tunnel-listener evictor rides the reload's synchronous
+  // clientKeys swap (doReload reads it back off hooks).
+  hooks.evictStaleMitmTunnels = /** @type {any} */ (server).evictStaleMitmTunnels;
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.

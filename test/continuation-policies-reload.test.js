@@ -93,7 +93,7 @@ test('boot without the field is legacy; reload adds, changes and fail-safes root
     assert.equal(forced.status, 200, 'legacy force still hops');
     assert.deepEqual(hits, ['k1', 'k1', 'k2']);
     const bootStatus = await status(port);
-    assert.deepEqual(bootStatus.capabilities, { continuationPolicies: 1, workerIdentity: false });
+    assert.deepEqual(bootStatus.capabilities, { continuationPolicies: 1, workerIdentity: true });
     assert.deepEqual(bootStatus.continuationPolicies, []);
     assert.deepEqual(bootStatus.continuationPolicyErrors, []);
     assert.equal(bootStatus.continuationPolicyLoadError, null);
