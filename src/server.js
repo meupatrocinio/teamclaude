@@ -17,7 +17,7 @@ import { createContinuationTelemetry } from './continuation-telemetry.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
-import { conversationDigest, pinKeyFor, workerScopedPinKey } from './conversation.js';
+import { conversationDigest, pinKeyFor, workerScopedPinKey, workerScopePrefix } from './conversation.js';
 import { MAX_WORKERS_PER_CLIENT, MAX_WORKER_SESSIONS_PER_CLIENT } from './session-tracker.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
@@ -2239,8 +2239,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       /** @type {(legacyPin: string|null) => string|null} */
       const scopePinKey = (legacyPin) => workerScopedPinKey(requestKeyHash, workerId, legacyPin);
       const workerScoped = !!(workerId && requestKeyHash);
+      // The worker's key family, so a thread continue resolves only inside the
+      // requesting worker's own scope (W2 isolation) — and an unscoped request
+      // (null) never matches a worker-scoped record.
+      const workerScope = workerScoped ? workerScopePrefix(requestKeyHash, workerId) : null;
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
-        ? placeConversation(accountManager, body, sessionId, scopePinKey)
+        ? placeConversation(accountManager, body, sessionId, scopePinKey, workerScope)
         : { conversation: null, pinKey: scopePinKey(pinKeyFor(sessionId, null)), onMessage: null };
 
       // The reasoning effort the client asked for, for the activity view only:
@@ -5757,12 +5761,15 @@ const CONTINUE_MARKER = Buffer.from('"continue"');
  *   (AI-1960): identity without a worker id. Applied to the legacy pin key so
  *   both the placed conversation and the thread-message record land under the
  *   scoped key.
+ * @param {string|null} [scope]  the requesting worker's key family
+ *   (`workerScopePrefix`), so a continue resolves its message id only inside
+ *   its own worker scope; null (no worker id) never matches a scoped record.
  * @returns {{ conversation: string|null, pinKey: string|null, onMessage: ((messageId: string) => void)|null }}
  */
-function placeConversation(accountManager, body, sessionId, mapPinKey = (k) => k) {
+function placeConversation(accountManager, body, sessionId, mapPinKey = (k) => k, scope = null) {
   const thread = requestThread(body);
   const conversation = thread?.continues
-    ? accountManager.threadOwner(sessionId, thread.continues)?.conversation ?? null
+    ? accountManager.threadOwner(sessionId, thread.continues, scope)?.conversation ?? null
     : conversationDigest(body);
   const legacyPinKey = pinKeyFor(sessionId, conversation);
   const pinKey = legacyPinKey ? mapPinKey(legacyPinKey) : legacyPinKey;

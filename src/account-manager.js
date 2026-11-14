@@ -2218,13 +2218,17 @@ export class AccountManager {
 
   /**
    * The conversation of `sessionId` that produced message `messageId`, or null.
+   * `scope` (AI-1960) is the requesting worker's key family: a scoped request
+   * resolves only inside its own scope, an unscoped one never inside a worker
+   * scope (W2 isolation).
    *
    * @param {string|null} sessionId
    * @param {unknown} messageId
+   * @param {string|null} [scope]
    * @returns {{ key: string, conversation: string|null }|null}
    */
-  threadOwner(sessionId, messageId) {
-    return this.sessionTracker.threadOwner(sessionId, messageId);
+  threadOwner(sessionId, messageId, scope = null) {
+    return this.sessionTracker.threadOwner(sessionId, messageId, undefined, scope);
   }
 
   /**

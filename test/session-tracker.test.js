@@ -643,3 +643,27 @@ test('a conversation holds a bounded number of thread messages, newest kept', ()
   assert.equal(st.threadOwner('S', 'msg_0', clock.t), null);
   assert.equal(st.threadOwner('S', `msg_${MAX_THREAD_MESSAGES}`, clock.t)?.key, 'S/conv');
 });
+
+test('a thread continue never crosses a worker scope (AI-1960, W2 isolation)', () => {
+  // Two workers on one client key share the session label 'S'; each files its
+  // conversation under its own scoped key. A continue from worker B naming a
+  // message id worker A recorded must find NO owner — resolving it would pin
+  // B's request over A's conversation. A legacy (unscoped) lookup likewise
+  // never matches a worker-scoped record.
+  const { clock, now } = fixedClock();
+  const scopeA = `w:${'a'.repeat(32)}\0`;
+  const scopeB = `w:${'b'.repeat(32)}\0`;
+  const keyA = `${scopeA}S/conv`;
+  const st = threaded(now, keyA);
+  st.recordThreadMessage(keyA, 'msg_1', null, clock.t);
+  assert.equal(st.threadOwner('S', 'msg_1', clock.t, scopeB), null, 'worker B sees nothing of A');
+  assert.equal(st.threadOwner('S', 'msg_1', clock.t), null, 'an unscoped lookup never matches a scoped record');
+  assert.deepEqual(st.threadOwner('S', 'msg_1', clock.t, scopeA), { key: keyA, conversation: 'conv' },
+    'the same worker still resolves its own thread');
+  // A legacy record beside the scoped one stays visible to unscoped lookups only.
+  st.beginRequest('S/other', now(), { sessionId: 'S', conversation: 'other' });
+  st.endRequest('S/other', now());
+  st.recordThreadMessage('S/other', 'msg_9', null, clock.t);
+  assert.equal(st.threadOwner('S', 'msg_9', clock.t)?.key, 'S/other');
+  assert.equal(st.threadOwner('S', 'msg_9', clock.t, scopeA), null, 'a scoped lookup never matches a legacy record');
+});

@@ -487,15 +487,24 @@ export class SessionTracker {
    * lifetime and its own sweep to stay in step with the records holding them.
    * One walk per continue is one per agent turn.
    *
+   * `scope` (AI-1960, W2 isolation) is the requesting worker's key family
+   * (`workerScopePrefix`, `w:<32hex>\0`): with it, only records under that
+   * prefix can own the message — worker B never resolves an id worker A
+   * recorded under the same client session. Without it (a request with no
+   * worker id) the walk keeps today's behaviour over legacy records and never
+   * matches a worker-scoped one.
+   *
    * @param {string|null} sessionId
    * @param {unknown} messageId
    * @param {number} [now]
+   * @param {string|null} [scope]
    * @returns {{ key: string, conversation: string|null }|null}
    */
-  threadOwner(sessionId, messageId, now = this._now()) {
+  threadOwner(sessionId, messageId, now = this._now(), scope = null) {
     if (!sessionId || !isMessageId(messageId)) return null;
     for (const [key, s] of this.sessions) {
       if (s.sessionId !== sessionId || !s.threads.has(messageId)) continue;
+      if (scope ? !key.startsWith(scope) : INTERNAL_WORKER_KEY_SHAPE.test(key)) continue;
       if (this._isExpired(s, now)) { this.sessions.delete(key); return null; }
       return { key, conversation: s.conversation };
     }

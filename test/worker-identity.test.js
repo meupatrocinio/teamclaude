@@ -226,6 +226,46 @@ test('a thread continue stays on the worker-scoped record (scoped onMessage wiri
   });
 });
 
+test('a thread continue from another worker finds no owner (W2 isolation)', T, async () => {
+  // Worker A's create files msg_1 under A's scoped record. Worker B — same key,
+  // same client session — continues msg_1: with the walk unscoped, B would
+  // resolve A's conversation and inherit its identity/affinity. Scoped, B finds
+  // no owner and pins by session alone.
+  await withGateway({ extraConfig: { messageThreads: true } }, async ({ send, am, legacyPin, scopedPin }) => {
+    const scopedA = scopedPin(KEYS.amy, W1, legacyPin('s-xthread', 'opening'));
+    const create = JSON.stringify({
+      model: 'claude-opus-4-1',
+      messages: [{ role: 'user', content: 'opening' }],
+      thread: { type: 'create' },
+    });
+    assert.equal((await send({ worker: W1, session: 's-xthread', body: create })).status, 200);
+    assert.ok(am.sessionTracker.sessions.get(scopedA)?.threads.has('msg_1'));
+
+    const cont = JSON.stringify({
+      model: 'claude-opus-4-1',
+      messages: [{ role: 'user', content: 'delta only' }],
+      thread: { type: 'continue', previous_message_id: 'msg_1' },
+    });
+    const r2 = await send({ worker: W2, session: 's-xthread', body: cont });
+    assert.equal(r2.status, 200);
+    // No owner in B's scope: the continue placed no conversation, so B pins by
+    // session alone (pinKeyFor(session, null) is the bare session id) rather
+    // than over A's conversation.
+    const scopedB = scopedPin(KEYS.amy, W2, 's-xthread');
+    const recB = am.sessionTracker.sessions.get(scopedB);
+    assert.ok(recB, 'B filed its own scoped record');
+    assert.equal(recB.conversation, null, 'B inherited nothing from A');
+    // A's record is untouched, and nothing landed on a legacy key.
+    assert.equal(am.sessionTracker.sessions.get(scopedA)?.count, 1);
+    for (const key of am.sessionTracker.sessions.keys()) assert.ok(key.startsWith('w:'), `no legacy record: ${JSON.stringify(key)}`);
+
+    // The same worker's own continue still resolves through its scoped record.
+    const r3 = await send({ worker: W1, session: 's-xthread', body: cont });
+    assert.equal(r3.status, 200);
+    assert.equal(am.sessionTracker.sessions.get(scopedA)?.count, 2, 'A continues its own conversation');
+  });
+});
+
 test('a request with no session id scopes nothing and invents no pin', T, async () => {
   await withGateway({}, async ({ send, attempts, am }) => {
     const r = await send({ worker: W1, session: null, text: 'no session' });

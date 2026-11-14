@@ -280,7 +280,26 @@ export function pinKeyFor(sessionId, digest) {
  * @returns {string|null}
  */
 export function workerScopedPinKey(keyHash, workerId, legacyPinKey) {
-  if (!workerId || !keyHash || !legacyPinKey) return legacyPinKey;
+  if (!legacyPinKey) return legacyPinKey;
+  const prefix = workerScopePrefix(keyHash, workerId);
+  return prefix ? prefix + legacyPinKey : legacyPinKey;
+}
+
+/**
+ * The key family every record of one worker scope lives under:
+ * `w:` + the first 32 hex chars of sha256(keyHash NUL workerId) + NUL — the
+ * scoped pin key above without its legacy suffix. A thread-continue lookup
+ * (`SessionTracker.threadOwner`) uses it to stay inside the requesting
+ * worker's scope, so worker B can never resolve a message id worker A
+ * recorded (W2 isolation); a request with no worker id passes null and never
+ * matches a scoped record either. Null when there is nothing to derive with.
+ *
+ * @param {string|null|undefined} keyHash  the authenticated client key's hash
+ * @param {string|null|undefined} workerId an already-validated `w1_<32hex>` value
+ * @returns {string|null}
+ */
+export function workerScopePrefix(keyHash, workerId) {
+  if (!workerId || !keyHash) return null;
   const scope = createHash('sha256').update(`${keyHash}\0${workerId}`).digest('hex').slice(0, 32);
-  return `w:${scope}\0${legacyPinKey}`;
+  return `w:${scope}\0`;
 }
