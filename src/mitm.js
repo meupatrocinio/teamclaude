@@ -20,7 +20,8 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders, usableClientKeys } from './server.js';
+import { keyHashOf } from './client-routes.js';
 import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -268,6 +269,13 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // client), for the same reason. The map is bounded by accounts × client keys,
   // both operator-controlled.
   const serverPromises = new Map();
+  // AI-1960 (the AI-1903 review fix): the tunnel sockets each memo entry is
+  // serving, mapKey → Set<socket>. The memoized Http2SecureServers never
+  // listen() — sockets are fed to them by hand below — and Node 22 has no
+  // closeAllConnections on them, so evicting an entry (a key rotation leaving
+  // its keyHash behind) has to close the server AND destroy the tunnels it
+  // holds open itself.
+  const tunnelSockets = new Map();
   const getServer = (/** @type {string} */ pin = '', /** @type {string|null} */ client = null, /** @type {string|null} */ keyHash = null) => {
     // The keyHash (AI-1903, E10) joins the memo key so two keys that share a
     // client name never share a listener — each tunnel keeps the hash its own
@@ -373,7 +381,42 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     return p;
   };
 
-  return (req, clientSocket, head) => {
+  /**
+   * AI-1960 (the AI-1903 review fix): evict every memo entry whose keyHash is
+   * no longer a current client key — a rotation otherwise leaks one listener
+   * (and its live tunnels) per old hash for the process's lifetime. Entries
+   * with an EMPTY keyHash segment (the shared apiKey, the open gate, the
+   * loopback exemption) are exempt: they outlive key rotations legitimately.
+   * Called from doReload (index.js) in the same synchronous stretch as the
+   * clientKeys swap. Sockets are destroyed explicitly: these servers never
+   * listen(), and Node 22 has no closeAllConnections on them, so srv.close()
+   * alone would leave the held-open tunnels alive.
+   * @param {Record<string, any>|null|undefined} proxyConfig  the live proxy config, post-swap
+   */
+  const evictStaleTunnels = (proxyConfig) => {
+    const keys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
+    const valid = new Set(keys.map((/** @type {any} */ e) => keyHashOf(e.key)));
+    for (const [mapKey, p] of [...serverPromises]) {
+      const keyHash = mapKey.split('\0')[2] || '';
+      if (!keyHash || valid.has(keyHash)) continue;
+      serverPromises.delete(mapKey);
+      p.then((/** @type {import('node:http2').Http2SecureServer} */ srv) => {
+        try { srv.close(); } catch { /* best effort: never listened */ }
+        // Read the set NOW, not at eviction time: a CONNECT whose mint resolved
+        // between the delete above and here attached its tunnel to a fresh set,
+        // and that socket is every bit as stale as the ones present then.
+        const sockets = tunnelSockets.get(mapKey);
+        tunnelSockets.delete(mapKey);
+        for (const sock of sockets || []) { try { sock.destroy(); } catch { /* already gone */ } }
+      }).catch(() => { /* a failed mint needs no teardown */ });
+    }
+  };
+
+  // How many tunnel listeners the memo currently holds. For tests — the bound
+  // the evictor above restores across key rotations.
+  const tunnelListenerCount = () => serverPromises.size;
+
+  const handler = (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
 
     // Auth gate — mirror the HTTP path: loopback is exempt, everything else must
@@ -496,12 +539,43 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
+    const mapKey = `${pin || ''}\0${auth.client || ''}\0${auth.keyHash ?? ''}`;
     getServer(pin || '', auth.client, auth.keyHash ?? null).then((srv) => {
+      // A reload may have evicted this entry while the mint was in flight: its
+      // keyHash is gone, so this tunnel must not be tracked or served. Answer
+      // like the auth gate above rather than bare-destroying — a reset with no
+      // CONNECT status line is reported by clients as "Proxy connection ended
+      // before receiving CONNECT response", while a 407 tells the client to
+      // re-authenticate (with its new key) and retry.
+      if (!serverPromises.has(mapKey)) {
+        try {
+          clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
+        } catch { /* client already gone */ }
+        clientSocket.destroy();
+        return;
+      }
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
+      // Track the tunnel against its memo entry (see tunnelSockets above) so
+      // evictStaleTunnels can tear down what a key rotation orphaned.
+      if (!clientSocket.destroyed) {
+        let sockets = tunnelSockets.get(mapKey);
+        if (!sockets) tunnelSockets.set(mapKey, sockets = new Set());
+        sockets.add(clientSocket);
+        // 'close' is not replayed to a late listener, hence the destroyed guard
+        // above: a socket already gone by the time the mint resolved is never
+        // tracked.
+        clientSocket.once('close', () => {
+          sockets.delete(clientSocket);
+          if (!sockets.size && !serverPromises.has(mapKey)) tunnelSockets.delete(mapKey);
+        });
+      }
       srv.emit('connection', clientSocket);
     }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
   };
+  handler.evictStaleTunnels = evictStaleTunnels;
+  handler.tunnelListenerCount = tunnelListenerCount;
+  return handler;
 }
 
 // The Basic username from a CONNECT's `Proxy-Authorization`, or null. This is

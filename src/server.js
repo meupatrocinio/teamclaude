@@ -17,7 +17,8 @@ import { createContinuationTelemetry } from './continuation-telemetry.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
-import { conversationDigest, pinKeyFor } from './conversation.js';
+import { conversationDigest, pinKeyFor, workerScopedPinKey, workerScopePrefix } from './conversation.js';
+import { MAX_WORKERS_PER_CLIENT, MAX_WORKER_SESSIONS_PER_CLIENT } from './session-tracker.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
@@ -192,7 +193,36 @@ const SEAT_INTERNAL_HEADERS = new Set([
   // AI-1903 (C7/E7): the cg contract version header gates the owner-root 429
   // paragraph; it is ours, never upstream's, on every path.
   'x-teamclaude-cg-contract',
+  // AI-1960 (W2/E8/E9): the opt-in worker identity. Ours alone — validated at
+  // the entry stacks and stripped on every upstream-bound path (this set covers
+  // the relay/passthrough request sides and every relayed response; the
+  // buffered forward path strips it via ctx.stripHeaders).
+  'x-teamclaude-worker-id',
 ]);
+
+// AI-1960 (contract W2): the only admissible worker-identity value. An absent
+// header is the legacy path; a PRESENT header that does not match is a
+// non-unified 400 answered before any upstream I/O.
+const WORKER_ID_HEADER = 'x-teamclaude-worker-id';
+const WORKER_ID_SHAPE = /^w1_[a-f0-9]{32}$/;
+const WORKER_ID_MESSAGE = 'Invalid x-teamclaude-worker-id header: expected "w1_" followed by 32 lowercase hex characters';
+
+// Whether the request carries a worker-id header value we must refuse. Never
+// echoes the value: it is client-supplied and the answer is client-readable.
+/** @param {import('node:http').IncomingHttpHeaders} headers */
+export function malformedWorkerId(headers) {
+  const raw = headers?.[WORKER_ID_HEADER];
+  if (raw === undefined || raw === null) return false;
+  return typeof raw !== 'string' || !WORKER_ID_SHAPE.test(raw);
+}
+
+// The validated worker id a request carries, or null. Callers gate on
+// malformedWorkerId first, so a non-null return here is always well-formed.
+/** @param {import('node:http').IncomingHttpHeaders} headers */
+function requestWorkerId(headers) {
+  const raw = headers?.[WORKER_ID_HEADER];
+  return typeof raw === 'string' && WORKER_ID_SHAPE.test(raw) ? raw : null;
+}
 
 // Response headers describing the SERVING organization's billing state:
 // whether extra usage (overage) is enabled, why it is not, whether it is in
@@ -397,7 +427,7 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
 // Config arrays already checked for shape, so the warnings below fire once per
 // loaded list (a reload hands over a new array) rather than once per request.
 const checkedClientKeys = new WeakSet();
-function usableClientKeys(clientKeys) {
+export function usableClientKeys(clientKeys) {
   if (!checkedClientKeys.has(clientKeys)) {
     checkedClientKeys.add(clientKeys);
     const seen = new Set();
@@ -648,7 +678,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config), config.proxy); return; }
+      //
+      // AI-1960 (W2): this dispatch never passes through the proxy request
+      // listener, so it validates the worker-id header for itself — a malformed
+      // one is a non-unified 400 before any upstream I/O.
+      if (/^https?:\/\//i.test(req.url || '')) {
+        if (malformedWorkerId(req.headers)) {
+          res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: WORKER_ID_MESSAGE } }));
+          return;
+        }
+        relayHttpForward(req, res, shouldStripOverageHeaders(config), config.proxy);
+        return;
+      }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -712,11 +754,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // AI-1959: the attempt-log writer's counters are admin-only like the
           // policy list beside them; a client key never sees them.
           continuationTelemetry: continuationTelemetry.status(),
+          // AI-1960: live worker-scope counts, admin-only. Counts and caps
+          // alone — never a keyHash or a worker id (E14).
+          workerScopes: /** @type {any} */ (accountManager).sessionTracker?.workerScopeCounts?.()
+            ?? { workers: 0, sessions: 0, maxPerClient: { workers: MAX_WORKERS_PER_CLIENT, sessions: MAX_WORKER_SESSIONS_PER_CLIENT } },
         };
         const callerPolicy = req.tcClient ? callerContinuationPolicy(policyTable, req.tcClient, req.tcKeyHash ?? null) : undefined;
         res.end(JSON.stringify({
           ...extra, ...status, ...routing,
-          capabilities: { continuationPolicies: 1, workerIdentity: false },
+          capabilities: { continuationPolicies: 1, workerIdentity: true },
           ...adminPolicies,
           caller: callerView(req.tcClient, seat, callerPolicy),
           upstreamPool: upstreamPoolStatus(),
@@ -1332,7 +1378,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, continuationTelemetry }));
+  const connectHandler = createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, continuationTelemetry });
+  server.on('connect', connectHandler);
+  // AI-1960 (the AI-1903 review fix): a getServer memo entry is keyed with the
+  // CONNECT-time keyHash, so a key rotation leaks one listener per old hash.
+  // The evictor drops the entries whose keyHash left the valid set (closing
+  // the server and destroying its tracked tunnel sockets); threaded out here
+  // so the reload path (index.js doReload) can run it in the same synchronous
+  // stretch as the clientKeys swap. The count is the test hook for the bound.
+  /** @type {any} */ (server).evictStaleMitmTunnels = (/** @type {Record<string, any>|null|undefined} */ proxyConfig) => /** @type {any} */ (connectHandler).evictStaleTunnels?.(proxyConfig);
+  /** @type {any} */ (server).mitmTunnelListenerCount = () => /** @type {any} */ (connectHandler).tunnelListenerCount?.() ?? 0;
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -1813,6 +1868,22 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
     // already closed.
     let openEntry = null;
     try {
+      // AI-1960 (contract W2): a malformed worker identity is refused before
+      // anything else on this stack — no body read, no upstream I/O. Covers the
+      // base listener AND the MITM terminating server, which shares this
+      // listener; the relay dispatch has its own check (requestHandler), and on
+      // the MITM WebSocket-upgrade path the header is strip-only (no JSON 400
+      // is answerable mid-upgrade). Same shape and logging as the dot-segment
+      // refusal below.
+      if (malformedWorkerId(req.headers)) {
+        const reqId = ++counter;
+        const sessionId = req.headers['x-claude-code-session-id'] || null;
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: malformed worker id)', status: 400, model: null, sessionId, pinned: false });
+        res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: WORKER_ID_MESSAGE } }));
+        recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
+        return;
+      }
       // Refused before any path-prefix classification below, so each of those
       // sees the path upstream will see (see hasDotSegment). Logged like the
       // unknown-pin 404: an operator should see a client probing the boundary.
@@ -2157,9 +2228,24 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
       const provider = providerForPath(req.url);
+      // AI-1960 (contract W2): a valid worker id plus an authenticated client
+      // keyHash scopes the pin key to the worker, so same-key workers get
+      // isolated pins and offers. No header, no keyHash (admin/shared key —
+      // Decision 4) or no legacy pin (no session/opening) means the legacy pin,
+      // byte-exact. The scoped key is threaded through placeConversation too,
+      // so a thread continue's message id is filed under the scoped record the
+      // next continue of the SAME worker will look it up from.
+      const workerId = requestWorkerId(req.headers);
+      /** @type {(legacyPin: string|null) => string|null} */
+      const scopePinKey = (legacyPin) => workerScopedPinKey(requestKeyHash, workerId, legacyPin);
+      const workerScoped = !!(workerId && requestKeyHash);
+      // The worker's key family, so a thread continue resolves only inside the
+      // requesting worker's own scope (W2 isolation) — and an unscoped request
+      // (null) never matches a worker-scoped record.
+      const workerScope = workerScoped ? workerScopePrefix(requestKeyHash, workerId) : null;
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
-        ? placeConversation(accountManager, body, sessionId)
-        : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
+        ? placeConversation(accountManager, body, sessionId, scopePinKey, workerScope)
+        : { conversation: null, pinKey: scopePinKey(pinKeyFor(sessionId, null)), onMessage: null };
 
       // The reasoning effort the client asked for, for the activity view only:
       // nothing routes on it. Read from the whole body rather than peeked from
@@ -2186,6 +2272,30 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // AI-1960 (contract W2): admit the worker scope under the per-client and
+      // global caps BEFORE the session begins, and before the usage recorder
+      // books the request — a refused request is booked nowhere, like the
+      // blocked-model refusal above. Fail closed with a non-unified 429 —
+      // never another client's state evicted, never a collapse to the legacy
+      // pin. Re-admission of the scope's own conversation is free, so a
+      // retried request never 429s against itself.
+      if (workerScoped && pinKey && !/** @type {any} */ (accountManager).sessionTracker.admitWorkerScope(requestKeyHash, workerId, pinKey)) {
+        if (!res.headersSent) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'rate_limit_error', message: 'Too many worker scopes for this client key: the worker identity or worker-scoped session cap is reached. Stop sending x-teamclaude-worker-id, or retry after idle scopes expire.' },
+          }));
+        }
+        // Scoped like the blocked-model refusal: the conversation that asked,
+        // not every conversation of the wire session (sibling workers' scoped
+        // records included).
+        recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(worker scope cap)', status: 429, model, effort, sessionId });
+        return;
+      }
+
       // Per-client attribution: the base server stamps req.tcClient from the
       // key that authenticated; the MITM terminating server has no per-request
       // key (auth happened at CONNECT time) and carries it as forcedClient
@@ -2208,12 +2318,26 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // x-tc-caller is the operator's own attribution hint (see the gate above).
       // x-teamclaude-cg-contract (AI-1903, C7) gates the owner-root 429 copy;
       // it is a proxy-control header and never travels upstream.
-      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy', 'x-teamclaude-cg-contract']);
+      // x-teamclaude-worker-id (AI-1960, W2) names the worker to this proxy's
+      // affinity bookkeeping; it is never upstream's either. The dominant
+      // forward path strips from THIS list — SEAT_INTERNAL_HEADERS alone does
+      // not cover it.
+      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy', 'x-teamclaude-cg-contract', 'x-teamclaude-worker-id']);
 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
+      //
+      // AI-1960 (E21): the weekly bucket is fixed at ADMISSION, once, and every
+      // later consumer (the pin write, the offer record/take fences) reads
+      // ctx.bucket — a mid-request reload that changes the route→bucket mapping
+      // must not re-bucket an in-flight request.
+      const admissionBucket = /** @type {any} */ (accountManager)._weeklyBucketFor?.(model) ?? weeklyBucketForModel(model);
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config),
+        // AI-1960: the admission-fixed weekly bucket (E21) and, below at
+        // beginSession, the per-bucket pin sequence (E12) — null for a
+        // non-completion path, which never writes a pin.
+        bucket: admissionBucket, pinSeq: null,
         // Client routes (IPM fork): the binding read at admission, kept for every
         // retry and hop of this request. boundExclude is every other account,
         // so a multi-account seat hops only inside itself.
@@ -2235,7 +2359,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
-      accountManager.beginSession(pinKey, {
+      //
+      // AI-1960 (E12): the pin sequence is allocated here, after the in-flight
+      // hold is taken, and only for a completion request that reached routing —
+      // a count_tokens or any pre-routing refusal never allocates, so it can
+      // never become "latest" and never writes a pin. The sequence rides the
+      // ctx, so retries and hops keep it.
+      ctx.pinSeq = accountManager.beginSession(pinKey, {
         client,
         // The key is the conversation; these name it for the readout, which
         // groups by the session an operator recognises and needs the
@@ -2243,7 +2373,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         sessionId,
         conversation,
         dimensions: Object.fromEntries(usageDimensions.map(d => [d.name, d.key])),
-      });
+      }, isCompletionPath(classifiedPath) ? admissionBucket : null);
       // Everything forwardRequest waits on — the upstream admission queue, the
       // upstream request itself, a quota-hold or rate-limit timer, a silent SSE
       // read — is cancelled the moment the client goes away, so a departed
@@ -3554,7 +3684,7 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
     res.end(answer.body);
     if (ctx.boundPinned && verdict.kind === 'spent' && queue?.next
         && ctx.bound.indices.length > 1 && ctx.pinKey && ctx.client && ctx.seat && accountIndex != null) {
-      const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+      const bucket = ctx.bucket ?? (accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model));
       // E13: an in-flight request admitted under one root revision must not
       // record an offer under another. The snapshot governs: when the key's
       // currently loaded root revision differs from the admitted one (a reload
@@ -3710,7 +3840,9 @@ function pickBoundAccount(accountManager, ctx) {
     return accountSupportsModel(account, ctx.model) && accountSupportsModel(account, ctx.advisorModel);
   });
   const candidates = compatible.length ? compatible : left;
-  const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+  // AI-1960 (E21): the bucket fixed on the ctx at admission, not a recomputation
+  // — a mid-request reload must not move an in-flight request's affinity family.
+  const bucket = ctx.bucket ?? (accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model));
   const pinIdx = ctx.pinKey ? accountManager.sessionTracker.pinnedAccount(ctx.pinKey, bucket) : null;
   if (pinIdx != null && compatible.includes(pinIdx)) {
     ctx.boundPinned = true;
@@ -4131,7 +4263,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // (for affinity) and keep it "active" in the running-sessions readout. Passive
   // when distribution is off. Not for a seat-less catalog read under client
   // routes (IPM fork): it spends no quota and must not steer the session.
-  if (!ctx.noAffinity) accountManager.recordSession(ctx.pinKey, account.index, ctx.model);
+  // AI-1960: the bucket is the one fixed on the ctx at admission (E21) and the
+  // write is gated on the request's pin sequence (E12) — a stale request whose
+  // retry or hop lands here after a newer request started cannot re-pin, and a
+  // count_tokens (pinSeq null) writes no pin at all.
+  if (!ctx.noAffinity) accountManager.recordSession(ctx.pinKey, account.index, ctx.model, { bucket: ctx.bucket, seq: ctx.pinSeq });
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
@@ -5621,14 +5757,22 @@ const CONTINUE_MARKER = Buffer.from('"continue"');
  * @param {any} accountManager
  * @param {Buffer} body
  * @param {string} sessionId
+ * @param {(pinKey: string|null) => string|null} [mapPinKey]  the worker-scope derivation
+ *   (AI-1960): identity without a worker id. Applied to the legacy pin key so
+ *   both the placed conversation and the thread-message record land under the
+ *   scoped key.
+ * @param {string|null} [scope]  the requesting worker's key family
+ *   (`workerScopePrefix`), so a continue resolves its message id only inside
+ *   its own worker scope; null (no worker id) never matches a scoped record.
  * @returns {{ conversation: string|null, pinKey: string|null, onMessage: ((messageId: string) => void)|null }}
  */
-function placeConversation(accountManager, body, sessionId) {
+function placeConversation(accountManager, body, sessionId, mapPinKey = (k) => k, scope = null) {
   const thread = requestThread(body);
   const conversation = thread?.continues
-    ? accountManager.threadOwner(sessionId, thread.continues)?.conversation ?? null
+    ? accountManager.threadOwner(sessionId, thread.continues, scope)?.conversation ?? null
     : conversationDigest(body);
-  const pinKey = pinKeyFor(sessionId, conversation);
+  const legacyPinKey = pinKeyFor(sessionId, conversation);
+  const pinKey = legacyPinKey ? mapPinKey(legacyPinKey) : legacyPinKey;
   // What a later continue will name: the id of the message answering this one.
   const onMessage = thread && pinKey
     ? (/** @type {string} */ id) => accountManager.recordThreadMessage(pinKey, id, thread.continues)

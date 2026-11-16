@@ -418,7 +418,7 @@ test('status: capabilities always, admin fields for the operator only, caller po
   const policyErrors = [{ client: 'carol', reason: 'stale_key', carriedForward: true }];
   await withGateway({ policies, policyErrors }, async ({ control }) => {
     const admin = (await control('/teamclaude/status')).json;
-    assert.deepEqual(admin.capabilities, { continuationPolicies: 1, workerIdentity: false });
+    assert.deepEqual(admin.capabilities, { continuationPolicies: 1, workerIdentity: true });
     assert.deepEqual(admin.continuationPolicies, [{ client: 'amy', mode: 'force', revision: 'r_one', quarantine: false }]);
     assert.deepEqual(admin.continuationPolicyErrors, [{ client: 'carol', reason: 'stale_key', carriedForward: true }]);
     assert.equal(admin.continuationPolicyLoadError, null);
@@ -426,7 +426,7 @@ test('status: capabilities always, admin fields for the operator only, caller po
     assert.ok(!JSON.stringify(admin).includes(keyHashOf('amy-key')), 'the keyHash leaked into status');
 
     const amy = (await control('/teamclaude/status', KEYS.amy)).json;
-    assert.deepEqual(amy.capabilities, { continuationPolicies: 1, workerIdentity: false });
+    assert.deepEqual(amy.capabilities, { continuationPolicies: 1, workerIdentity: true });
     assert.deepEqual(amy.caller.continuationPolicy, { source: 'root', mode: 'force', revision: 'r_one' });
     assert.ok(!('continuationPolicies' in amy), 'a client key never reads the admin list');
     assert.ok(!('continuationPolicyErrors' in amy));
@@ -441,7 +441,7 @@ test('status: capabilities always, admin fields for the operator only, caller po
 test('status without the config fields: capabilities present, empty admin fields', async () => {
   await withGateway({}, async ({ control }) => {
     const admin = (await control('/teamclaude/status')).json;
-    assert.deepEqual(admin.capabilities, { continuationPolicies: 1, workerIdentity: false });
+    assert.deepEqual(admin.capabilities, { continuationPolicies: 1, workerIdentity: true });
     assert.deepEqual(admin.continuationPolicies, []);
     assert.deepEqual(admin.continuationPolicyErrors, []);
     assert.equal(admin.continuationPolicyLoadError, null);

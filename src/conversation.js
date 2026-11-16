@@ -258,3 +258,48 @@ export function pinKeyFor(sessionId, digest) {
   if (!sessionId) return null;
   return digest ? `${sessionId}${SEPARATOR}${digest}` : sessionId;
 }
+
+/**
+ * The effective pin key for a request carrying a validated worker identity
+ * (AI-1960, contract W2): `w:` + the first 32 hex chars of
+ * sha256(keyHash NUL workerId) + NUL + the legacy pin key. The hash keeps both
+ * the raw keyHash and the worker id out of every tracker key, status payload
+ * and log line (E14), and folding the keyHash in makes the same wire value
+ * under two client keys fully isolated.
+ *
+ * Byte-compatible absence is the contract: with no worker id (or nothing to
+ * derive against) the legacy key comes back unchanged, so a request without
+ * the header behaves exactly as it always has. The `w:` prefix and the NUL
+ * separator are outside every client-suppliable alphabet (the session-id shape
+ * and the pin-key separator), so no client can spell this shape itself — which
+ * is what lets the tracker trust it as internally generated.
+ *
+ * @param {string|null|undefined} keyHash  the authenticated client key's hash
+ * @param {string|null|undefined} workerId an already-validated `w1_<32hex>` value
+ * @param {string|null} legacyPinKey
+ * @returns {string|null}
+ */
+export function workerScopedPinKey(keyHash, workerId, legacyPinKey) {
+  if (!legacyPinKey) return legacyPinKey;
+  const prefix = workerScopePrefix(keyHash, workerId);
+  return prefix ? prefix + legacyPinKey : legacyPinKey;
+}
+
+/**
+ * The key family every record of one worker scope lives under:
+ * `w:` + the first 32 hex chars of sha256(keyHash NUL workerId) + NUL — the
+ * scoped pin key above without its legacy suffix. A thread-continue lookup
+ * (`SessionTracker.threadOwner`) uses it to stay inside the requesting
+ * worker's scope, so worker B can never resolve a message id worker A
+ * recorded (W2 isolation); a request with no worker id passes null and never
+ * matches a scoped record either. Null when there is nothing to derive with.
+ *
+ * @param {string|null|undefined} keyHash  the authenticated client key's hash
+ * @param {string|null|undefined} workerId an already-validated `w1_<32hex>` value
+ * @returns {string|null}
+ */
+export function workerScopePrefix(keyHash, workerId) {
+  if (!workerId || !keyHash) return null;
+  const scope = createHash('sha256').update(`${keyHash}\0${workerId}`).digest('hex').slice(0, 32);
+  return `w:${scope}\0`;
+}

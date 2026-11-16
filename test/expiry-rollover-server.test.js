@@ -177,6 +177,13 @@ const RESTING_SUCCESSES = [
     whyState: 'a served request that rested on the destination left the roll held',
     next: 'a',
     whyNext: 'the confirmed stay did not settle the traffic on the destination',
+    // AI-1960 per-bucket sequencing: on the session path the two refused
+    // requests STARTED before the confirming one, so their late fallback pin
+    // writes are stale and dropped — the confirming request's pin stands and
+    // the session path keeps the traffic on b. (The current-account path holds
+    // no pin at all and is unchanged.)
+    nextSession: 'b',
+    whyNextSession: 'the stale fallback pin writes were dropped (AI-1960): the confirmed stay settled the session on the destination',
   },
 ];
 
@@ -513,7 +520,9 @@ for (const distribute of [false, true]) {
           ? am._pinRolledOver(sid, am.accounts[0], OPUS)
           : am._currentRolledOver(am.accounts[0], OPUS);
         assert.equal(stillOwed, success.rolledOver, success.whyState);
-        assert.equal(await send(sid), success.next, success.whyNext);
+        const expectedNext = distribute && success.nextSession ? success.nextSession : success.next;
+        const whyNext = distribute && success.nextSession ? success.whyNextSession : success.whyNext;
+        assert.equal(await send(sid), expectedNext, whyNext);
       } finally {
         // Before close(), or a failed assertion leaves the handlers suspended.
         held.resolve();

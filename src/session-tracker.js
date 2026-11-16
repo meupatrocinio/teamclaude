@@ -67,6 +67,26 @@ export const MAX_SESSION_ID_LENGTH = 128;
 // depend on the caller it is guarding against.
 export const MAX_KEY_LENGTH = MAX_SESSION_ID_LENGTH + 1 + 22;
 
+// AI-1960 (contract W2): a worker-scoped pin key is internally generated as
+// `w:<32 lowercase hex of sha256(keyHash NUL workerId)>` NUL <legacy pin key>
+// (see conversation.js workerScopedPinKey). At most 2 + 32 + 1 + 151 = 186
+// chars; 253 is the hard cap, kept as headroom. The prefix is un-spoofable:
+// ':' and NUL are outside the session-id alphabet (server.js SESSION_ID_SHAPE)
+// and the pin-key separator alphabet, so only this proxy can mint the shape —
+// which is why it, alone, bypasses the silent truncation below.
+export const MAX_INTERNAL_KEY_LENGTH = 253;
+const INTERNAL_WORKER_KEY_SHAPE = /^w:[a-f0-9]{32}\0/;
+
+// Worker-scope admission caps (AI-1960, contract W2): distinct worker ids and
+// worker-scoped sessions, per client key and process-wide. Past them admission
+// fails closed (the request path answers a non-unified 429) — another client's
+// state is never evicted, a scoped request never collapses to the legacy pin,
+// and an in-flight record is never evicted.
+export const MAX_WORKERS_PER_CLIENT = 64;
+export const MAX_WORKER_SESSIONS_PER_CLIENT = 256;
+export const MAX_WORKERS_GLOBAL = 1024;
+export const MAX_WORKER_SESSIONS_GLOBAL = 2048;
+
 // A message-thread continue names the message it follows and nothing else, so a
 // conversation keeps the ids of its threaded messages that a continue may still
 // name: the newest message of each thread running in it. That is one id for an
@@ -82,8 +102,13 @@ const isMessageId = (id) => typeof id === 'string' && id.length > 0 && id.length
 
 // The Map key for a client-supplied pin key. Bounded here so every entry point
 // keys the same way and a long key cannot hold more memory than a short one.
+// The one exemption is the internally generated worker-scope shape (see
+// INTERNAL_WORKER_KEY_SHAPE): un-spoofable and already hard-capped at
+// MAX_INTERNAL_KEY_LENGTH by its construction, so truncating it would only
+// collide two distinct worker scopes onto one record.
 function keyOf(key) {
   if (typeof key !== 'string' || key.length <= MAX_KEY_LENGTH) return key;
+  if (key.length <= MAX_INTERNAL_KEY_LENGTH && INTERNAL_WORKER_KEY_SHAPE.test(key)) return key;
   return key.slice(0, MAX_KEY_LENGTH);
 }
 
@@ -193,6 +218,18 @@ export class SessionTracker {
     //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
+    // AI-1960: the worker-scope registry, keyHash → { workers: Map<workerId,
+    // Set<pinKey>>, sessions: Map<pinKey, workerId>, lastSeen }. Counts and
+    // TTLs for the admission caps live here; the session records themselves
+    // stay in `sessions` under their scoped pin key, with the existing
+    // lifetime. Nothing in here ever carries a raw keyHash or worker id into a
+    // log or a status payload (E14) — the registry is keyed by them precisely
+    // so it never has to appear anywhere else.
+    this.workerRegistry = new Map();
+    // The process-wide pin-write sequence (AI-1960): monotonically increasing,
+    // allocated once per admitted completion request, compared per (record,
+    // bucket) so a late-finishing stale request can no longer re-pin.
+    this._pinSeq = 0;
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
     this._now = now || (() => Date.now());
@@ -211,16 +248,48 @@ export class SessionTracker {
   // key from operator-supplied routing config and does not validate it, and a
   // key that is not a string names no quota field there either: the session
   // simply keeps re-routing rather than the request path throwing.
-  touch(sessionId, accountIndex = null, bucket = null, now = this._now()) {
+  //
+  // `seq` (AI-1960) is the per-request pin sequence allocated at admission:
+  //   - undefined: a legacy caller with no notion of sequencing — writes, as
+  //     before (every existing direct caller);
+  //   - null: a request that reached routing but is not a completion (E12:
+  //     count_tokens) — the visit is recorded, no pin is written;
+  //   - a number: writes only while it is still the LATEST sequence allocated
+  //     for this (record, bucket). A stale request whose retry or hop finishes
+  //     routing after a newer request started cannot restore its destination.
+  touch(sessionId, accountIndex = null, bucket = null, now = this._now(), seq = undefined) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null && typeof bucket === 'string' && bucket) {
-      s.pins.set(bucket, { idx: accountIndex, at: now });
+      const latest = s.latestSeq.get(bucket) ?? null;
+      const mayWrite = seq === undefined || (seq !== null && (latest == null || seq >= latest));
+      if (mayWrite) s.pins.set(bucket, { idx: accountIndex, at: now });
     }
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
+  }
+
+  // Allocate the pin-write sequence for one admitted request (AI-1960): a
+  // process-wide monotonic number, recorded as the latest started for this
+  // (record, bucket). Called once per request, at admission, AFTER the
+  // request's in-flight hold was taken (beginRequest), and only for completion
+  // requests that reached routing (E12) — an early exit or a count_tokens call
+  // never allocates, so it never becomes "latest" and never writes a pin.
+  // Retries and hops of the same request keep the one sequence.
+  /**
+   * @param {string|null} sessionId
+   * @param {string|null} bucket
+   * @param {number} [now]
+   * @returns {number|null}
+   */
+  allocatePinSeq(sessionId, bucket, now = this._now()) {
+    if (!sessionId || typeof bucket !== 'string' || !bucket) return null;
+    const s = this._ensure(sessionId, now);
+    const seq = ++this._pinSeq;
+    s.latestSeq.set(bucket, seq);
+    return seq;
   }
 
   // Mark a request for this session as started. A session with any request in
@@ -418,15 +487,24 @@ export class SessionTracker {
    * lifetime and its own sweep to stay in step with the records holding them.
    * One walk per continue is one per agent turn.
    *
+   * `scope` (AI-1960, W2 isolation) is the requesting worker's key family
+   * (`workerScopePrefix`, `w:<32hex>\0`): with it, only records under that
+   * prefix can own the message — worker B never resolves an id worker A
+   * recorded under the same client session. Without it (a request with no
+   * worker id) the walk keeps today's behaviour over legacy records and never
+   * matches a worker-scoped one.
+   *
    * @param {string|null} sessionId
    * @param {unknown} messageId
    * @param {number} [now]
+   * @param {string|null} [scope]
    * @returns {{ key: string, conversation: string|null }|null}
    */
-  threadOwner(sessionId, messageId, now = this._now()) {
+  threadOwner(sessionId, messageId, now = this._now(), scope = null) {
     if (!sessionId || !isMessageId(messageId)) return null;
     for (const [key, s] of this.sessions) {
       if (s.sessionId !== sessionId || !s.threads.has(messageId)) continue;
+      if (scope ? !key.startsWith(scope) : INTERNAL_WORKER_KEY_SHAPE.test(key)) continue;
       if (this._isExpired(s, now)) { this.sessions.delete(key); return null; }
       return { key, conversation: s.conversation };
     }
@@ -453,6 +531,11 @@ export class SessionTracker {
       this._makeRoom(now);
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        // bucket -> latest allocated pin sequence (AI-1960). Same per-bucket
+        // map pattern as `pins` and `tokens`; dies with the record, and a
+        // record with a request in flight is never evicted, so sequencing
+        // state never outlives the session it sequences.
+        latestSeq: new Map(),
         // client + route + bucket -> SeatContinuation. One disclosed choice per
         // scope; a newer handoff response replaces the older one.
         seatContinuations: new Map(),
@@ -842,6 +925,140 @@ export class SessionTracker {
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) this.sessions.delete(id);
     }
+    this._pruneWorkerRegistry(now);
+  }
+
+  // ── Worker scopes (AI-1960) ───────────────────────────────────────────────
+  //
+  // One registry entry per authenticated client key hash: the worker ids it has
+  // admitted and the worker-scoped session records they own. The records live
+  // in `sessions` like any other; the registry exists to answer the admission
+  // questions (caps, ownership) and to expire with them.
+
+  // Total worker ids / worker-scoped sessions across every client.
+  _workerCount() {
+    let n = 0;
+    for (const scope of this.workerRegistry.values()) n += scope.workers.size;
+    return n;
+  }
+
+  _workerSessionCount() {
+    let n = 0;
+    for (const scope of this.workerRegistry.values()) n += scope.sessions.size;
+    return n;
+  }
+
+  // Forget registry entries whose session record is gone or expired. This is
+  // the TTL half of cap recovery: an idle worker id or scoped session stops
+  // counting once its record has idled out, with no operator action. Never
+  // drops a live record — a stale registry line is bookkeeping, the record is
+  // the state.
+  _pruneWorkerRegistry(now = this._now()) {
+    for (const [keyHash, scope] of this.workerRegistry) {
+      for (const [pinKey, workerId] of [...scope.sessions]) {
+        const s = this.sessions.get(keyOf(pinKey));
+        if (s && !this._isExpired(s, now)) continue;
+        if (s) this.sessions.delete(keyOf(pinKey));
+        scope.sessions.delete(pinKey);
+        const owned = scope.workers.get(workerId);
+        if (owned) {
+          owned.delete(pinKey);
+          if (!owned.size) scope.workers.delete(workerId);
+        }
+      }
+      if (!scope.sessions.size && !scope.workers.size) this.workerRegistry.delete(keyHash);
+    }
+  }
+
+  /**
+   * Admit one worker-scoped session for (keyHash, workerId), or refuse.
+   *
+   * Fail-closed at every cap (the caller answers a non-unified 429 with
+   * x-should-retry: false):
+   *   - a 65th distinct worker id for this key, or a 1,025th process-wide;
+   *   - a 257th worker-scoped session for this key — after evicting THIS
+   *     client's own idle scoped records (never another client's, never one in
+   *     flight, and never by collapsing to the legacy pin);
+   *   - a 2,049th worker-scoped session process-wide.
+   *
+   * Re-admission of an already-known pair is free, so a retried request — or a
+   * worker reusing its conversation — never 429s against its own scope.
+   *
+   * @param {string} keyHash   the authenticated client key's hash
+   * @param {string} workerId  a validated `w1_<32hex>` worker id
+   * @param {string} pinKey    the worker-scoped pin key (conversation.js)
+   * @param {number} [now]
+   * @returns {boolean} admitted
+   */
+  admitWorkerScope(keyHash, workerId, pinKey, now = this._now()) {
+    if (typeof keyHash !== 'string' || !keyHash
+        || typeof workerId !== 'string' || !workerId
+        || typeof pinKey !== 'string' || !pinKey) return false;
+    this._pruneWorkerRegistry(now);
+    const scope = this.workerRegistry.get(keyHash);
+    // Every check runs BEFORE anything is registered: a refused admission must
+    // leave no worker id, session line or fresh registry entry behind (an empty
+    // worker registration would hold a per-client and a global slot until the
+    // process restarts).
+    const knownWorker = scope?.workers.has(workerId) === true;
+    if (!knownWorker) {
+      if ((scope?.workers.size ?? 0) >= MAX_WORKERS_PER_CLIENT) return false;
+      if (this._workerCount() >= MAX_WORKERS_GLOBAL) return false;
+    }
+    const knownSession = scope?.sessions.has(pinKey) === true;
+    if (!knownSession) {
+      // The global cap first: a request it refuses must not destroy this
+      // client's own idle records in the same-client eviction below.
+      if (this._workerSessionCount() >= MAX_WORKER_SESSIONS_GLOBAL) return false;
+      if (scope && scope.sessions.size >= MAX_WORKER_SESSIONS_PER_CLIENT) {
+        // Make room within this client's own scopes only, oldest admitted
+        // first (Map iteration is insertion-ordered). A record with a request
+        // in flight is skipped — an in-flight entry is never evicted — and no
+        // other client's state is touched.
+        for (const [key, owner] of [...scope.sessions]) {
+          if (scope.sessions.size < MAX_WORKER_SESSIONS_PER_CLIENT) break;
+          const s = this.sessions.get(keyOf(key));
+          if (s && s.inFlight > 0) continue;
+          if (s) this.sessions.delete(keyOf(key));
+          scope.sessions.delete(key);
+          const set = scope.workers.get(owner);
+          if (set) {
+            set.delete(key);
+            if (!set.size) scope.workers.delete(owner);
+          }
+        }
+        if (scope.sessions.size >= MAX_WORKER_SESSIONS_PER_CLIENT) return false;
+      }
+    }
+    let committed = scope;
+    if (!committed) {
+      committed = { workers: new Map(), sessions: new Map(), lastSeen: now };
+      this.workerRegistry.set(keyHash, committed);
+    }
+    committed.lastSeen = now;
+    if (!knownWorker) committed.workers.set(workerId, new Set());
+    if (!knownSession) {
+      // Create the record NOW: admission registers the scope before the request
+      // begins its session, and the registry's prune treats a registered pin
+      // with no record as expired — without this, two admissions in a row would
+      // unregister the first.
+      this._ensure(pinKey, now);
+      committed.sessions.set(pinKey, workerId);
+      committed.workers.get(workerId).add(pinKey);
+    }
+    return true;
+  }
+
+  // The status-endpoint counts (admin-only there): how many worker scopes and
+  // worker-scoped sessions are live, and the per-client caps a reader compares
+  // them against. Counts only — no keyHash, no worker id (E14).
+  workerScopeCounts(now = this._now()) {
+    this._pruneWorkerRegistry(now);
+    return {
+      workers: this._workerCount(),
+      sessions: this._workerSessionCount(),
+      maxPerClient: { workers: MAX_WORKERS_PER_CLIENT, sessions: MAX_WORKER_SESSIONS_PER_CLIENT },
+    };
   }
 
   // { known, active, perAccount: { [index]: activeCount }, perAccountBucket, tokens }
