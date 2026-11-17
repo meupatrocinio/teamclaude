@@ -1262,8 +1262,22 @@ export class AccountManager {
    * session fans out across many (see conversation.js). It is spelled
    * `sessionId` because it is one for every request that names no conversation,
    * and because the affinity it drives is the same affinity it always was.
+   *
+   * `bucket` (AI-2012) is the weekly bucket the request was ADMITTED under
+   * (server.js ctx.bucket, AI-1960 E21). Session-pin reads use it, so a reload
+   * that remaps the model between admission and a re-selecting retry does not
+   * read another bucket's pin. Quota and eligibility reads stay live. Omitted
+   * or null, the pin reads use the live mapping, as every non-request caller does.
+   *
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {string|null} [sessionId]
+   * @param {string} [provider]
+   * @param {Record<string, any>|null} [decision]
+   * @param {string|null} [bucket]
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null, bucket = null) {
     // Selection reads this.currentIndex as "where the fleet is". With more than
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
@@ -1307,7 +1321,7 @@ export class AccountManager {
       // shrink both sets, so its counts describe that request and not the fleet.
       const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
       routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
-      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
+      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId, bucket);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
@@ -1665,7 +1679,14 @@ export class AccountManager {
     this.advisorEligibility = advisorEligibilityMode(setting);
   }
 
-  _pickActiveAccount(exclude, model, advisorModel, sessionId) {
+  /**
+   * @param {Set<number>|null} exclude
+   * @param {*} model
+   * @param {*} advisorModel
+   * @param {string|null} sessionId
+   * @param {string|null} [bucket]  the admission bucket (AI-2012); null = live
+   */
+  _pickActiveAccount(exclude, model, advisorModel, sessionId, bucket = null) {
     // Taken before anything in this pass can move the cursor: the quota-reset
     // switch below moves it, and treating its destination as a resting place
     // prices an account the request was only aimed at. Not taken for an account
@@ -1676,8 +1697,12 @@ export class AccountManager {
     // whether or not those walks run: `recordSession` is always on. Read only
     // where the walks read it, a session routed while distribution is off would
     // freeze its observation at the last walk and miss the stays in between.
+    //
+    // AI-2012: every session-pin read in this walk uses the bucket the request
+    // was admitted under, resolved once here; quota reads stay live.
+    const pinBucket = bucket ?? this._weeklyBucketFor(model);
     if (sessionId) {
-      this._restOnPin(sessionId, this._weeklyBucketFor(model), exclude, model);
+      this._restOnPin(sessionId, pinBucket, exclude, model);
     }
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
@@ -1696,13 +1721,13 @@ export class AccountManager {
     // nothing eligible is found (e.g. the whole tier is exhausted).
     if (sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
       if (this.distributeSessions) {
-        const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
+        const acc = this._selectForSession(sessionId, exclude, model, advisorModel, pinBucket);
         if (acc) return acc;
       } else if (this._isDrainingSession(sessionId)) {
         // Distribution was just turned off. Sessions that already existed keep
         // their account so the prompt cache they built there survives; everything
         // else falls through to the normal quota-driven walk below.
-        const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel);
+        const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel, pinBucket);
         if (acc) return acc;
       }
     }
@@ -1859,13 +1884,21 @@ export class AccountManager {
     return candidates[cursor % candidates.length];
   }
 
-  _selectForSession(sessionId, exclude, model, advisorModel) {
+  /**
+   * @param {string} sessionId
+   * @param {Set<number>|null} exclude
+   * @param {*} model
+   * @param {*} advisorModel
+   * @param {string|null} [bucket]  the admission bucket (AI-2012); null = live
+   */
+  _selectForSession(sessionId, exclude, model, advisorModel, bucket = null) {
     // The pin is per governing bucket, and this request is bound by the
     // EXECUTOR's: one request goes to one account, so the executor's affinity is
     // what binds it and the advisor's model is a constraint on that choice
-    // (_isAvailable, below) rather than a second key.
-    const bucket = this._weeklyBucketFor(model);
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    // (_isAvailable, below) rather than a second key. AI-2012: the bucket the
+    // request was admitted under, when the caller passes one.
+    const pinBucket = bucket ?? this._weeklyBucketFor(model);
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, pinBucket);
     // The bucket's own pin first. Failing that, any account this conversation
     // already sits on for another family: one conversation stays on one account
     // unless that account cannot serve the request (the README's "pins it
@@ -1898,7 +1931,7 @@ export class AccountManager {
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
-          && this._pinRolledOver(sessionId, pinned, model)) {
+          && this._pinRolledOver(sessionId, pinned, model, pinBucket)) {
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
           // A fleet-wide rollover moves every session pinned to that account at
@@ -2960,12 +2993,17 @@ export class AccountManager {
 
   /** Honour a draining session's existing pin — and only that. Unlike
    *  _selectForSession there is no least-loaded fallback: distribution is being
-   *  wound down, so a session that cannot stay put rejoins the normal walk. */
-  _selectDrainingSession(sessionId, exclude, model, advisorModel) {
+   *  wound down, so a session that cannot stay put rejoins the normal walk.
+   *  @param {string} sessionId
+   *  @param {Set<number>|null} exclude
+   *  @param {*} model
+   *  @param {*} advisorModel
+   *  @param {string|null} [bucket]  the admission bucket (AI-2012); null = live */
+  _selectDrainingSession(sessionId, exclude, model, advisorModel, bucket = null) {
     // Same candidate order as _selectForSession: the request's own bucket pin,
     // then any account the session already sits on for another family.
-    const bucket = this._weeklyBucketFor(model);
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    const pinBucket = bucket ?? this._weeklyBucketFor(model);
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, pinBucket);
     // The reading was taken at the head of this pass, so this walk writes
     // nothing and cannot spend a roll however it leaves.
     const candidates = pinIdx != null ? [pinIdx] : [];
@@ -2980,7 +3018,7 @@ export class AccountManager {
       // and is otherwise unbounded: an active session renews its own idle
       // window. Breaking hands the session to the ordinary walk, which aims.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
-          && this._pinRolledOver(sessionId, pinned, model)) break;
+          && this._pinRolledOver(sessionId, pinned, model, pinBucket)) break;
       // Mirror _select's priority preemption, as _selectForSession does.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
@@ -3581,12 +3619,19 @@ export class AccountManager {
    * The generation stamps a request selects under. Read BEFORE the walk: a move
    * the walk makes is the request arriving, not finding traffic already at rest,
    * and only the latter can confirm a stay. Null with the knob off.
+   *
+   * `bucket` (AI-2012) is the request's admission bucket: the pin observation
+   * is read, and stamped, under it. Omitted or null, the live mapping.
+   *
+   * @param {string|null} [sessionId]
+   * @param {string|null} [model]
+   * @param {string|null} [bucket]
    */
-  observedGeneration(sessionId = null, model = null) {
+  observedGeneration(sessionId = null, model = null, bucket = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return null;
-    const bucket = sessionId ? this._weeklyBucketFor(model) : null;
-    const pin = sessionId ? this.sessionTracker.refsFor(sessionId, bucket) : null;
-    return { current: this._currentObs?.gen ?? null, pin: pin?.gen ?? null, bucket };
+    const pinBucket = sessionId ? (bucket ?? this._weeklyBucketFor(model)) : null;
+    const pin = sessionId ? this.sessionTracker.refsFor(sessionId, pinBucket) : null;
+    return { current: this._currentObs?.gen ?? null, pin: pin?.gen ?? null, bucket: pinBucket };
   }
 
   /**
@@ -3668,9 +3713,15 @@ export class AccountManager {
   /** Has this session's pin rolled over since traffic was last found resting on
    *  it? Scoped to the window `_governingWindow` names, so one family's roll is
    *  not read from another's clock, and to the account the observation names: a
-   *  reading taken on one account is not evidence about another. */
-  _pinRolledOver(sessionId, pinned, model) {
-    const obs = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model));
+   *  reading taken on one account is not evidence about another. The
+   *  observation is the pin's on `bucket` (the admission bucket, AI-2012) when
+   *  given; the governing window stays live, since it is a quota read.
+   *  @param {string} sessionId
+   *  @param {Record<string, any>} pinned
+   *  @param {*} model
+   *  @param {string|null} [bucket] */
+  _pinRolledOver(sessionId, pinned, model, bucket = null) {
+    const obs = this.sessionTracker.refsFor(sessionId, bucket ?? this._weeklyBucketFor(model));
     if (!obs || obs.idx !== pinned.index) return false;
     return this._jumped(obs.windows, this._governingWindow(pinned, model));
   }

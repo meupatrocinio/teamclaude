@@ -3969,8 +3969,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // is no evidence about a rest either.
   const hopTo = ctx.hopTo ?? null;
   ctx.hopTo = null;
+  // AI-2012: pin reads use the admission bucket (ctx.bucket, AI-1960 E21), so
+  // a reload between admission and a re-selecting retry cannot move this
+  // request onto another bucket's pin. A ctx built without one reads live.
   const restingGen = ctx.pinnedIndex == null && hopTo == null && !ctx.bound
-    ? accountManager.observedGeneration(ctx.pinKey, ctx.model)
+    ? accountManager.observedGeneration(ctx.pinKey, ctx.model, ctx.bucket ?? null)
     : null;
 
   // Select account, skipping any already tried (and failed) this request.
@@ -4012,7 +4015,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : ctx.bound
         ? pickBoundAccount(accountManager, ctx)
         : accountManager.getActiveAccount(
-          ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
+          ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection, ctx.bucket ?? null,
         );
   // AI-1959: an armed continuation whose destination is not THIS attempt's
   // account was abandoned before its send (a pre-send re-check moved the
