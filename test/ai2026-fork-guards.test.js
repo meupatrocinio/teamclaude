@@ -151,6 +151,30 @@ test('(3) a route-bound seat answering a billing 400 relays it, with no sibling 
   });
 });
 
+// An account refusal (upstream's OAuth account-refusal failover) and a 402
+// billing answer (upstream's #626 failover): both leave the seat unmoved.
+const REFUSAL_400 = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'This account is on hold.', details: { error_code: 'account_on_hold' } } });
+const BILLING_402 = JSON.stringify({ type: 'error', error: { type: 'billing_error', message: 'Billing is unavailable.' } });
+const answer = (/** @type {number} */ status, /** @type {string} */ text) => (/** @type {any} */ res) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(text); };
+
+test('(3b) a route-bound seat answering an account-refusal 400 or a 402 relays it; unbound traffic still fails over', async () => {
+  for (const [status, text] of /** @type {[number, string][]} */ ([[400, REFUSAL_400], [402, BILLING_402]])) {
+    const routes = [{ name: 'seat-a', clients: ['ana'], accounts: ['sa', 'sb'] }];
+    await withGateway({ routes, handler: (who, _req, res) => (who === 'sa' ? answer(status, text)(res) : ok(res)) }, async ({ send, seen }) => {
+      const r = await send({ key: KEYS.ana, session: `sess-seat-${status}` });
+      assert.equal(r.status, status, `the seat's ${status} is relayed`);
+      assert.equal(r.text, text);
+      assert.deepEqual(seen.map(s => s.who), ['sa'], `a ${status} on the seat tries neither the seat sibling nor the fleet`);
+    });
+    // Control: the same answer from every account moves an unbound request on,
+    // so the guard above is what keeps the seat request in place.
+    await withGateway({ routes: [], handler: (_who, _req, res) => answer(status, text)(res) }, async ({ send, seen }) => {
+      await send({ key: KEYS.uma, session: `sess-fleet-${status}` });
+      assert.ok(seen.length > 1, `an unbound ${status} fails over (attempts: ${seen.map(s => s.who).join(',')})`);
+    });
+  }
+});
+
 // ── (4) compactBeforeSwitch ─────────────────────────────────────────────────
 
 test('(4) compactBeforeSwitch never answers its synthetic 400 to a request bound to a seat', async () => {
