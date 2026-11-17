@@ -213,9 +213,17 @@ const affinityTime = value => typeof value === 'number' && Number.isFinite(value
 // for a damaged file, which must not restore more than a live record can hold.
 const MAX_BUCKET_LENGTH = 128;
 export const MAX_AFFINITY_PINS = 64;
+// A saved record's key, bounded as keyOf bounds a live one: a client-supplied
+// key up to MAX_KEY_LENGTH, or a worker-scoped key (AI-1960) up to
+// MAX_INTERNAL_KEY_LENGTH, which only this proxy mints and which keyOf never
+// truncates. Without the second, every worker-scoped conversation longer than
+// MAX_KEY_LENGTH lost its pins across a restart (IPM fork, AI-2026).
+/** @param {unknown} key @returns {key is string} */
+const affinityKey = key => boundedString(key, MAX_KEY_LENGTH)
+  || (boundedString(key, MAX_INTERNAL_KEY_LENGTH) && INTERNAL_WORKER_KEY_SHAPE.test(key));
 /** @param {any} row @returns {row is AffinitySession} */
 function affinityRow(row) {
-  return row != null && boundedString(row.key, MAX_KEY_LENGTH)
+  return row != null && affinityKey(row.key)
     && (row.sessionId === null || boundedString(row.sessionId, MAX_SESSION_ID_LENGTH))
     && (row.conversation === null || boundedString(row.conversation, 22))
     && affinityTime(row.lastSeen)
