@@ -53,7 +53,6 @@ import { sanitizeText, safeLine } from './safe-text.js';
 import { parseEndsAt, describeEndsAt } from './ends-at.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
-import { statusLabel } from './error-type.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -952,7 +951,10 @@ async function serverCommand() {
       // one bracketed tag: [no-seat], [spent], [admin-pin] and the rest.
       const pin = info.gate ? ` [${safeLine(info.gate, 32)}]` : (info.pinned || r?.pinned) ? ' [pin]' : '';
       const cache = cacheUsageLabel(info.cacheUsage);
-      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+      // The status stays alone in the parentheses (IPM fork, AI-2026): the
+      // gateway console parses `(<status>, <dur>s)` off this file line, so
+      // upstream's error type (#672) follows it instead.
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${info.errorType ? ` ${info.errorType}` : ''}${cache ? ` ${cache}` : ''}`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;

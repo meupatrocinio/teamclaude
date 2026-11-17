@@ -40,6 +40,7 @@ import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { safeLine } from './safe-text.js';
 import { rememberResetReading, resetRetryAt } from './reset-readings.js';
 import { proxyFetch } from './upstream-fetch.js';
+import { isLongLived } from './long-lived.js';
 
 export const CLAUDE_RESET_PROGRAM = 'cedar_ember';
 const RESET_HOST = 'https://api.anthropic.com';
@@ -619,7 +620,7 @@ export class ClaudeResetRedeemer {
     // A long-lived (inference-only) token can neither read reset status nor
     // claim, and a scope denial on the claim would read as "may have been
     // spent" and hold every other account's resets (as in _attempt).
-    if (account.longLived === true) {
+    if (isLongLived(account)) {
       return { outcome: 'declined', account: name, reason: 'long_lived_account' };
     }
     if (this.pending.size > 0 && this.now() < this.fleetHoldUntil) {
@@ -856,6 +857,9 @@ export class ClaudeResetRedeemer {
     try { this.am.clearRateLimited(account.index); } catch { /* not held */ }
     try { this.am.clearUpstreamRejected(account.index); } catch { /* not rejected */ }
     const read = await this.readStatus(account, { timeoutMs: Math.max(1, deadline - this.now()) });
+    // A reload during the read can renumber the accounts.
+    account = this._liveAccount(account);
+    if (!account) return;
     if (read?.usage && !read.usage.error) this.am.applyUsageData(account.index, read.usage);
   }
 }

@@ -235,11 +235,12 @@ async function startProxy(phase, version, proxyPort, tripPort) {
   let exited = null;
   child.on('exit', (code, signal) => { exited = { code, signal }; });
   const sockets = startSocketSampler(child.pid);
+  let ready = false;
   for (let i = 0; i < 200; i++) {
     if (exited) break;
     try {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`, { headers: { 'x-api-key': ADMIN_KEY }, signal: AbortSignal.timeout(1500) });
-      if (r.ok) { const j = await r.json(); if (j?.server?.pid === child.pid) break; }
+      if (r.ok) { const j = await r.json(); if (j?.server?.pid === child.pid) { ready = true; break; } }
     } catch { /* not up yet */ }
     await sleep(100);
   }
@@ -250,7 +251,7 @@ async function startProxy(phase, version, proxyPort, tripPort) {
   } catch { /* ss missing */ }
   return {
     child, pid: child.pid, activityLog, sockets, bound,
-    started: !exited,
+    started: ready && !exited,
     exited: () => exited,
     output: () => output,
     stop: async () => {
@@ -384,7 +385,7 @@ async function scenarioCap(expectRoot) {
       && t2.headers['x-should-retry'] === 'false' && !t2.headers['anthropic-ratelimit-unified-7d-reset'],
     `10-seat route all spent: ${t2.upstreamAttempts.length} upstream attempts (1 + ${hops} hops, c9 never tried), ${t2.status} x-should-retry=${t2.headers['x-should-retry']} msg="${(t2.message || '').slice(0, 140)}"`);
   } else {
-    check('1b cap route under pre-root build', t2.status === 429 ? 'INFO' : 'INFO', `${brief(t2)}`);
+    check('1b cap route under pre-root build', 'INFO', `${brief(t2)}`);
   }
   return { t1, t2 };
 }
@@ -592,12 +593,10 @@ const P = Object.fromEntries(phases.map((p) => [p.phase, p]));
   check('4 invalid worker id', inv.r.status === 400 && inv.upstreamDelta === 1 && inv.ok.status === 200,
     `invalid "w1_Z…": ${inv.r.status} ${inv.r.headers['x-should-retry'] ? `x-should-retry=${inv.r.headers['x-should-retry']} ` : ''}"${inv.r.message}"; 0 upstream attempts for it; next valid request ${brief(inv.ok)}; proxy still up`);
   const capA = P.A.snapshot.admin.capabilities;
-  const capClient = P.A.snapshot.callers; // per-client capabilities checked below
   check('4 status capabilities.workerIdentity', capA?.workerIdentity === true, `admin capabilities=${JSON.stringify(capA)}`);
   const leaks = P.A.upstreamHeaderLeaks;
   check('4 headers stripped before upstream', leaks.length === 0 && !P.A.upstreamClientKeySeen,
     `x-teamclaude-worker-id / cg-contract / seat-policy / x-api-key reaching mock upstream in main (A): ${leaks.length}; client key seen upstream: ${P.A.upstreamClientKeySeen}`);
-  void capClient;
 }
 
 // 5. Secrets in responses, status and logs.

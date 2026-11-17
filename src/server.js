@@ -2338,12 +2338,9 @@ function isClientCredentialPath(path, config, controlPlane = config?.proxy?.cont
  */
 function effectiveControlPlane(config, accountManager, client) {
   const explicit = config?.proxy?.controlPlane;
-  if (explicit !== undefined) return explicit;
+  if (explicit != null) return explicit;
   if (config?.proxy?.requireClientRoute === true) return 'pool';
-  if (client) {
-    const on = routeForClient(accountManager?.clientRoutes, client);
-    if (on && ('route' in on || 'ambiguous' in on)) return 'pool';
-  }
+  if (client && routeForClient(accountManager?.clientRoutes, client)) return 'pool';
   return explicit;
 }
 
@@ -2741,6 +2738,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           || (boundTo ?? '').toLowerCase() === (requestClient ?? '').trim().toLowerCase();
         if (sessionPin != null && pinApplies) {
           pinnedIndex = resolveAccountPin(accountManager, sessionPin);
+          // The operator's pin replaces the client's own: a list tail the
+          // client sent (`/tc-acct/a,b`) never outlives it (AI-2026).
+          pinChain = [];
           pinSource = 'session';
           if (pinnedIndex == null) {
             const reqId = ++lastRequestId;
@@ -2804,7 +2804,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             // AI-2026 (fork wins over #645): a list pin's tail never applies
             // to a key on a fixed seat. advancePinPastBilling would otherwise
             // walk a `seat,other` pin off the seat on a billing refusal.
-            pinChain = null;
+            pinChain = [];
             const r = resolveClientRoute(accountManager, routed, resolveAccountPin);
             if (pinnedIndex != null && !r.indices.includes(pinnedIndex)) {
               const foreign = /** @type {any} */ (accountManager).accounts[pinnedIndex]?.name ?? null;
@@ -6238,7 +6238,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // credential. GET only: those calls are, and a completion never is, so
       // the client's login is never spent on inference. A pin keeps its
       // account for every request, as before.
-      if (req.method === 'GET' && ctx.pinnedIndex == null
+      // Never for a request bound to a fixed seat (IPM fork, AI-2026): its
+      // calls stay on the seat, as in ipm.24.
+      if (req.method === 'GET' && ctx.pinnedIndex == null && !ctx.bound
           && account.type === 'oauth' && providerOf(account) === DEFAULT_PROVIDER
           && responseBody != null && isOAuthScopeInsufficient(responseBody)
           && /^Bearer \S/i.test(String(req.headers.authorization || ''))) {
