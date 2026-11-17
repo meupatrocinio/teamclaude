@@ -60,6 +60,7 @@ const RENEW_AHEAD_MS = 120_000;
  * @property {number} [expires_in]
  * @property {string} client_id     the app the token was issued to; a refresh has to name it
  * @property {number} obtained_at   when this access token was issued, epoch ms
+ * @property {number} [signed_in_at] when the sign-in was made, epoch ms; a renewal keeps it (see callbackSessionOf)
  */
 
 /**
@@ -75,30 +76,27 @@ const RENEW_AHEAD_MS = 120_000;
  * @property {boolean} [envelope]  resolve with the whole reply (`data` and `paging`) rather than `data` alone
  */
 
-let warnedBase = /** @type {string|null} */ (null);
-
 /**
  * The origin the API is reached at. An override must be https:, or plain http:
  * to this machine only (a test mock): the access token rides in a header to
  * whatever this names, so an inherited variable must not be able to point it at
  * a cleartext or arbitrary host silently.
  *
+ * An override that is SET but not acceptable throws: it is never replaced by the
+ * default. Whoever set it meant another store, and falling back would send this
+ * install's token to callback.net instead — a typo turned into a leak.
+ *
  * @param {NodeJS.ProcessEnv} [env]
- * @param {(message: string) => void} [warn]
  * @returns {string}
  */
-export function callbackBase(env = process.env, warn = (m) => console.error(m)) {
+export function callbackBase(env = process.env) {
   const raw = envVar('CALLBACK_API_BASE', env);
   if (!raw) return DEFAULT_BASE;
   let u = null;
-  try { u = new URL(raw); } catch { /* reported below */ }
+  try { u = new URL(raw); } catch { /* refused below */ }
   const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
   if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return u.origin;
-  if (warnedBase !== raw) {
-    warnedBase = raw;
-    warn(`[TeamClaude] ignoring CALLBACK_API_BASE=${JSON.stringify(raw)}: it must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_BASE}`);
-  }
-  return DEFAULT_BASE;
+  throw new Error(`refusing to call the credential store: CALLBACK_API_BASE=${JSON.stringify(raw)} must be https:// (plain http:// is allowed for loopback only). Fix or unset it; it is not replaced by ${DEFAULT_BASE}, which would receive this install's token`);
 }
 
 /**
@@ -137,6 +135,18 @@ export async function loadCallbackToken() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Which sign-in a stored token belongs to, to tell one session from the next:
+ * its `signed_in_at`, which a renewal keeps (refreshCallbackToken keeps what
+ * the reply does not restate) and each sign-in sets anew, whoever it signs in
+ * as. "" for a token saved before sign-ins carried one, null for no token.
+ * @param {CallbackToken|null} token
+ * @returns {string|null}
+ */
+export function callbackSessionOf(token) {
+  return token ? String(token.signed_in_at ?? '') : null;
 }
 
 /** @param {CallbackToken} token */
@@ -323,7 +333,8 @@ export async function loginCallback({
     }
     if (code) {
       const token = await tokenRequest({ client_id: clientId, grant_type: 'authorization_code', code }, call);
-      return /** @type {CallbackToken} */ ({ ...token, client_id: clientId, obtained_at: now() });
+      const at = now();
+      return /** @type {CallbackToken} */ ({ ...token, client_id: clientId, obtained_at: at, signed_in_at: at });
     }
     if (now() >= deadline) throw new Error(`the sign-in was not approved within ${Math.round(lifetimeSeconds / 60)} minutes`);
     await sleep(POLL_PAUSE_MS);

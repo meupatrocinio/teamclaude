@@ -11,7 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
-  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
+  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS, accountGroups,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -538,6 +538,15 @@ test('without sessionDetail the banner still fires, unnamed', () => {
   assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1);
 });
 
+test('an account whose organization refused OAuth carries a badge until it serves again', () => {
+  const denied = accountBadges({
+    name: 'a', type: 'oauth', status: 'active',
+    entitlementDenial: { detail: 'OAuth authentication is currently not allowed for this organization.', since: 1, lastAt: 1, count: 3 },
+  }, null, null);
+  assert.deepEqual(denied.find(b => /denied/.test(b.text)), { cls: 'throttled', text: 'OAuth denied \u00d73' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth', status: 'active' }, null, null).some(b => /denied/.test(b.text)), false);
+});
+
 test('only the account states that need a person are reported', () => {
   // These clear themselves — rotation and back-off working.
   // `status = 'exhausted'` is never assigned anywhere in src/, so a fixture that
@@ -556,6 +565,11 @@ test('only the account states that need a person are reported', () => {
   const off = problems(fleetStatus(am => am.setDisabled(0, true)));
   assert.deepEqual(off.map(p => p.kind), ['account']);
   assert.match(off[0].text, /disabled/);
+  // An account upstream refused is not cured by a re-login alone.
+  const refused = problems(fleetStatus(am => am.markRefused(am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null })));
+  assert.deepEqual(refused.map(p => p.kind), ['account']);
+  assert.match(refused[0].text, /refused by upstream/);
+  assert.doesNotMatch(refused[0].text, /re-login/);
 });
 
 test('overage spend is not a banner line', () => {
@@ -673,7 +687,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, accountGroups]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -1015,7 +1029,7 @@ test('selecting a window relabels every table it governs', async () => {
 const CLIENT_CALLER = {
   kind: 'client',
   client: 'ci',
-  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable'],
+  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable', '/teamclaude/account-cordon'],
 };
 
 test('callerCan hides exactly the refused controls', () => {
@@ -1054,6 +1068,26 @@ test('cardNoteFor shows a result for its own card only, and only while recent', 
   bare['__proto__'] = { kind: 'ok', text: 'x', at };
   assert.equal(cardNoteFor(bare, '__proto__', at).text, 'x');
   assert.equal(cardNoteFor(undefined, 'alice@example.com', at), null);
+});
+
+test('accountGroups puts Claude first and keeps each provider\'s own order', () => {
+  // A Claude account added after the Codex ones still lands with the Claude cards.
+  const groups = accountGroups([
+    { name: 'c1' }, { name: 'x1', provider: 'codex' }, { name: 'c2', provider: 'anthropic' },
+    { name: 'x2', provider: 'codex' }, { name: 'c3' },
+  ]);
+  assert.deepEqual(groups.map(g => [g.provider, g.label, g.accounts.map(a => a.name)]), [
+    ['anthropic', 'Claude', ['c1', 'c2', 'c3']],
+    ['codex', 'Codex', ['x1', 'x2']],
+  ]);
+  // Claude leads even when a Codex account comes first; other providers keep first-seen order.
+  assert.deepEqual(accountGroups([{ name: 'x', provider: 'codex' }, { name: 'z', provider: 'zai' }, { name: 'c' }]).map(g => g.provider),
+    ['anthropic', 'codex', 'zai']);
+  // One provider is one group (drawn without a heading); nothing is no group.
+  assert.equal(accountGroups([{ name: 'a' }, { name: 'b' }]).length, 1);
+  assert.deepEqual(accountGroups(undefined), []);
+  // An account named __proto__ is grouped like any other.
+  assert.deepEqual(accountGroups([{ name: 'a', provider: '__proto__' }]).map(g => g.accounts.length), [1]);
 });
 
 test('cardNoteKey tells apart two cards with one name', () => {

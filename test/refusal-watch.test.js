@@ -100,7 +100,7 @@ test('streamResponse reports a mid-stream refusal to onRefusal while relaying ev
   const res = new Writable({ write(chunk, _e, cb) { received.push(Buffer.from(chunk)); cb(); } });
   res.writeHead = () => {};
   const findings = [];
-  await streamResponse(sseStream(body), res, 0, nullAccountManager(), null, null, null, null, null, f => findings.push(f));
+  await streamResponse(sseStream(body), res, 0, nullAccountManager(), null, null, null, null, null, null, true, f => findings.push(f));
   assert.deepEqual(findings, [{ rescued: false, category: 'cyber', explanation: 'Declined: malware construction help.' }]);
   assert.equal(Buffer.concat(received).toString(), body, 'the client sees the bytes unchanged');
 });
@@ -111,6 +111,6 @@ test('streamResponse reports nothing for an ordinary stream', async () => {
   const res = new Writable({ write(_c, _e, cb) { cb(); } });
   res.writeHead = () => {};
   const findings = [];
-  await streamResponse(sseStream(body), res, 0, nullAccountManager(), null, null, null, null, null, f => findings.push(f));
+  await streamResponse(sseStream(body), res, 0, nullAccountManager(), null, null, null, null, null, null, true, f => findings.push(f));
   assert.deepEqual(findings, []);
 });

@@ -4,19 +4,25 @@
     "apiKey": "tc-change-me-to-a-secret",
     "clientKeys": [
       { "name": "laptop", "key": "tc-laptop-own-secret" },
-      { "name": "build-box", "key": "tc-build-box-own-secret" }
+      { "name": "build-box", "key": "tc-build-box-own-secret" },
+      { "name": "sandboxed-agent", "key": "tc-sandboxed-agent-own-secret", "scope": "inference" }
     ],
     "usageDimensions": [
       { "name": "project", "header": "x-teamclaude-project" },
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
     "sessionDetail": false,
-    "mcp": "off"
+    "mcp": "off",
+    "drainTimeoutSeconds": 0,
+    "cliproxyApi": "off",
+    "controlPlane": "client",
+    "usageHistory": false
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "stripOverageHeaders": false,
   "synthesizeQuotaHeaders": false,
+  "poolQuotaHeaders": false,
   "continuationPolicies": [
     {
       "client": "laptop",
@@ -29,14 +35,25 @@
   "continuationPolicyErrors": [],
   "continuationAttemptsLog": null,
   "distributeSessions": false,
+  "compactBeforeSwitch": false,
+  "persistSessionAffinity": false,
+  "switchOnSessionReset": true,
+  "adaptiveDistribution": {
+    "scoring": "burndown"
+  },
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
   "autoRedeemResets": false,
+  "autoRedeemMinDaysToReset": 0,
+  "autoRedeemMaxShare": 1,
+  "autoRedeemMaxPerDay": 0,
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
-    "preempt": true
+    "preempt": true,
+    "reclaimHours": 0,
+    "reclaimAcrossOrganizations": false
   },
   "accounts": [
     {
@@ -62,6 +79,13 @@
       "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
     },
     {
+      "name": "year-token",
+      "type": "oauth",
+      "longLived": true,
+      "accessToken": "sk-ant-oat01-your-year-long-access-token",
+      "expiresAt": 1826000000000
+    },
+    {
       "name": "codex@example.com",
       "type": "oauth",
       "provider": "codex",
@@ -72,6 +96,7 @@
       "type": "apikey",
       "priority": 10,
       "disabled": false,
+      "cordoned": false,
       "apiKey": "sk-ant-api03-your-api-key"
     },
     {
@@ -84,6 +109,20 @@
       "serverHeader": "agy",
       "adapterHeaders": { "x-bridge-client-ip": "127.0.0.1" },
       "disabled": true
+    },
+    {
+      "name": "api-credit",
+      "type": "apikey",
+      "priority": 100,
+      "disabled": true,
+      "apiKey": "sk-ant-api03-your-credit-org-api-key",
+      "credit": {
+        "amount": 200,
+        "currency": "USD",
+        "cycleStart": "2026-11-02",
+        "adminKey": "sk-ant-admin01-your-admin-key",
+        "refreshMinutes": 15
+      }
     }
   ],
   "routes": [

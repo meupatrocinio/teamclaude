@@ -148,6 +148,17 @@ A successful confirmed continuation adds `x-teamclaude-seat-failover` with the s
 and `cold-cache=true`. It does not alter the assistant's response body or SSE events. Upstream-supplied
 copies of the internal policy/failover headers are discarded.
 
+A cordoned account (`teamclaude cordon`) inside a fixed seat keeps serving that seat: the seat belongs to the client, so a cordon takes no new fleet conversation onto the account but never empties the seat.
+
+Upstream's fleet re-routing never moves a request bound to a seat. Such a request takes no billing,
+account-refusal or model-unsupported failover and puts no billing cooldown on the account: upstream's
+answer is relayed as it was before (ipm.24). The tail of a list pin (`/tc-acct/a,b`) is dropped for a
+key on a route, and `compactBeforeSwitch` never asks a seat-bound request to compact. With
+`proxy.controlPlane` unset, `proxy.requireClientRoute: true` or a key on a route makes the control
+plane `"pool"`, so Claude Code's bootstrap, policy and registry calls go through the seat gate like
+inference, and a scope 403 on a seat account is answered from the seat, never relayed on the client's
+own login. An explicit `proxy.controlPlane` is honoured.
+
 Force applies only to genuine quota rejection. Throttling, credential/entitlement failures, 5xx,
 third-party 400s, stream failures, transport errors, operator caps, and token/routing failures never
 move a pinned conversation to a sibling. Fresh, unpinned conversations keep their ordinary queue
@@ -176,8 +187,7 @@ A client key cannot POST `/teamclaude/switch` (or `/teamclaude/session-pin`). Bo
 - `clientRoutes`: `[{ name, clients, accounts, resolved, problem? }]`, an empty list when none are
   configured;
 - `requireClientRoute`: `true` or `false`;
-- `capabilities`: `{ continuationPolicies: 1, workerIdentity: false }` — whether this build speaks
-  owner-root continuation policies (worker identity is a phase-2 item and stays `false`);
+- `capabilities`: `{ continuationPolicies: 1, workerIdentity: true }` — whether this build speaks owner-root continuation policies and accepts the opt-in `x-teamclaude-worker-id` worker identity (AI-1960);
 - `caller.seat` for a client-key caller: `{ name, accounts, resolved, state, windows, resetsAt }`, or
   `null` when the key has no seat. The admin-key poll never carries it;
 - `caller.continuationPolicy` for a client-key caller: its own `{ source: "root" | "legacy", mode,

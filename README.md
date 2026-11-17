@@ -38,6 +38,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
 - Optionally leans on accounts with Anthropic's paid extra usage once every account is out of free quota, instead of returning 429 (`allowExtraUsage`, off by default — it bills real money). Quota between the switch threshold and 100% is used first, on any account; billing starts only when none is left, and stops as soon as a window resets.
+- Separately opts subscriptions into using remaining included quota and then paid usage credits before lower-priority API capacity (`preferExtraUsage`, alongside `allowExtraUsage`). Manual subscription switches and conversation pins yield to eligible included quota. Eligible route pins, explicit API choices and hard restrictions still apply.
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
 - Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
@@ -55,7 +56,9 @@ teamclaude alias --install   # make plain `claude` go through the proxy
 teamclaude help              # everything else
 ```
 
-Full reference: [docs/usage.md](docs/usage.md).
+In the local TUI, **r** opens the account picker and its **Resets** panel. Choose a banked Claude reset or Codex reset credit, press **Enter** to review the warnings, then **y** to spend it. **r** reads fresh details; **Esc** closes the panel. A spend cannot be undone.
+
+Full reference, including [TUI keys](docs/usage.md#tui-keyboard-shortcuts): [docs/usage.md](docs/usage.md).
 
 ## Configuration
 
@@ -78,7 +81,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | Page | Contents |
 | --- | --- |
 | [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, syncing tokens across machines via callback.net, per-account proxy routing, Codex accounts, third-party backends |
-| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, logging |
+| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, CLIProxyAPI-compatible usage API, logging |
 | [VS Code](docs/vscode.md) | The Claude Code extension for VS Code through the proxy: settings, a check, updates |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |

@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -166,6 +166,31 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+/**
+ * The account cards split by provider, for a fleet that mixes them. Claude
+ * accounts come first, then each other provider in the order its first account
+ * appears; within a group the payload's order is kept, since that is the
+ * rotation order. An account with no provider is an Anthropic one, as the
+ * server treats it. A single-provider fleet is one group the page draws without
+ * a heading, so it looks as it did.
+ * @param {Array<Record<string, any>>|null|undefined} accounts
+ * @returns {{ provider: string, label: string, accounts: Array<Record<string, any>> }[]}
+ */
+export function accountGroups(accounts) {
+  /** @type {Record<string, Array<Record<string, any>>>} */
+  var by = Object.create(null);
+  /** @type {string[]} */
+  var order = [];
+  (accounts || []).forEach(function (a) {
+    var p = (a && a.provider) || 'anthropic';
+    if (!by[p]) { by[p] = []; order.push(p); }
+    by[p].push(a);
+  });
+  var first = order.indexOf('anthropic');
+  if (first > 0) { order.splice(first, 1); order.unshift('anthropic'); }
+  return order.map(function (p) { return { provider: p, label: providerLabel(p), accounts: by[p] }; });
+}
+
 // Every bucket switchThreshold can be keyed by, plus the short names the
 // threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
 // and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
@@ -266,6 +291,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   ];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
   badges.push({ cls: status, text: status });
+  // Cordoned: no new conversation goes here while the ones on it stay, with
+  // how many are left — what an operator waits to see reach 0 before a
+  // disable or a removal.
+  if (a.cordoned === true) badges.push({ cls: 'cordoned', text: 'cordoned' + (Number.isFinite(a.cordonRemaining) ? ' · ' + a.cordonRemaining + ' left' : '') });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
   // Free Codex rate-limit reset credits this account holds — what it could
@@ -285,7 +314,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
     var expires = Number.isFinite(reading.expiresAt)
       ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       : '';
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+    // Fable resets (oauth.js bankedResets) clear the Fable weekly only, so they
+    // are named apart from the resets that put every model back.
+    var fable = Number.isFinite(reading.fable) ? Math.min(Math.max(reading.fable, 0), credits) : 0;
+    var general = credits - fable;
+    var held = [];
+    if (general > 0) held.push(general + ' reset credit' + (general === 1 ? '' : 's'));
+    if (fable > 0) held.push(fable + ' Fable reset' + (fable === 1 ? '' : 's'));
+    badges.push({ cls: 'meta', text: held.join(', ') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -303,6 +339,9 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // password-masked (describeRouting), and absent for an account on the fleet
   // path, which is the default and earns no badge.
   if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
+  // Stays past the entitlement cooldown, until the account serves again.
+  var denial = a.entitlementDenial;
+  if (denial) badges.push({ cls: 'throttled', text: 'OAuth denied' + (denial.count > 1 ? ' \u00d7' + denial.count : '') });
   return badges;
 }
 
@@ -457,21 +496,24 @@ export function thresholdOutcome(res) {
  * move, or {disabled} to take an account out of rotation or put it back.
  *
  * @param {any} name
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  * @param {string|null} key
  */
 export function accountControlRequest(name, spec, key) {
-  var isPriority = spec.disabled === undefined;
-  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var isCordon = spec.cordoned !== undefined;
+  var isPriority = spec.disabled === undefined && !isCordon;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any, cordoned?: any }} */
   var body = { account: name };
   if (isPriority) {
     if (spec.place) body.place = spec.place;
     else body.priority = spec.priority;
+  } else if (isCordon) {
+    body.cordoned = spec.cordoned;
   } else {
     body.disabled = spec.disabled;
   }
   return {
-    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    url: isPriority ? '/teamclaude/priority' : isCordon ? '/teamclaude/account-cordon' : '/teamclaude/disable',
     init: {
       method: 'POST',
       headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
@@ -486,12 +528,22 @@ export function accountControlRequest(name, spec, key) {
  * 'first' or 'last'.
  *
  * @param {any} res
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  */
 export function accountControlOutcome(res, spec) {
   if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
   if (spec.disabled !== undefined) {
     return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  // A cordon reports what it leaves running, which is what an operator waits
+  // on, and warns when no other account is left to take new conversations.
+  if (spec.cordoned !== undefined) {
+    if (!res.cordoned) return { kind: 'ok', text: 'uncordoned ' + res.name + ': it takes new conversations again' };
+    var left = Number.isFinite(res.remaining) ? res.remaining : null;
+    var text = 'cordoned ' + res.name + ': no new conversations'
+      + (left == null ? '' : ', ' + left + ' still on it' + (left === 0 ? ', so disabling or removing it ends nothing running' : ''));
+    if (res.inService === 0) return { kind: 'warn', text: text + '; no other account takes new conversations now' };
+    return { kind: 'ok', text: text };
   }
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
 }
@@ -687,12 +739,16 @@ export function problems(status) {
   }
 
   // Only the two states that do not clear themselves. `entitlement` is a
-  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // cooldown of at most an hour and `upstream-rejected` is upstream's way of saying a
   // shared bucket is spent — both expire on their own, like `quota` and
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var why = ATTENTION[a.unavailable];
+    // A refusal from upstream (account-refusal.js) is not cured by a re-login
+    // alone; any error code other than the two dead-token ones is one.
+    var code = a.errorReason && a.errorReason.code;
+    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
@@ -732,9 +788,10 @@ export function usageFor(entry, view) {
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  creditText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -797,7 +854,7 @@ const PAGE = `<!doctype html>
   .tag { font-size: 12px; color: var(--dim); }
   .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
   .badge.active { color: var(--ok); border-color: var(--ok); }
-  .badge.throttled { color: var(--warn); border-color: var(--warn); }
+  .badge.throttled, .badge.cordoned { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
   .badge.provider { color: var(--text); }
@@ -863,6 +920,12 @@ const PAGE = `<!doctype html>
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  /* A mixed Claude/Codex fleet: one framed group per provider, so the cards of
+     one kind read together however the accounts were added. */
+  .acctgroup { border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 2px; margin-bottom: 14px; }
+  .acctgroup .card { margin-bottom: 8px; }
+  .acctgroup-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 0 6px 8px; }
+  .acctgroup-head .name { font-size: 13px; }
 </style>
 <script>
 (function () {
@@ -1061,7 +1124,20 @@ ${SHARED_HELPERS}
       ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
       head.appendChild(ctlDisable);
     }
-    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
+    // Cordon it, or put it back: no new conversation goes to it while the
+    // ones already on it stay, the graceful step before a disable or a
+    // removal. Drawn on a disabled card too, so an enable can bring it back
+    // cordoned.
+    if (callerCan(caller, '/teamclaude/account-cordon')) {
+      var ctlCordon = el('button', 'act', a.cordoned === true ? 'uncordon' : 'cordon');
+      ctlCordon.title = a.cordoned === true ? 'Send new conversations to this account again'
+        : 'Send no new conversations to this account; the ones on it stay until they finish';
+      ctlCordon.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { cordoned: !(a.cordoned === true) }, ctlCordon); });
+      head.appendChild(ctlCordon);
+    }
+    // Not on a cordoned card either: nothing new goes there, so a move would
+    // read as doing something and would not, until the uncordon.
+    if (!a.disabled && a.cordoned !== true && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
       ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
@@ -1070,7 +1146,9 @@ ${SHARED_HELPERS}
       head.appendChild(ctlLast);
     }
     card.appendChild(head);
-    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    // A cordon is the badge's to say: the account still serves what is on it.
+    if (a.unavailable && a.unavailable !== 'cordoned') card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    if (a.entitlementDenial) card.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since)));
     var q = a.quota || {};
     var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
@@ -1093,6 +1171,14 @@ ${SHARED_HELPERS}
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
     if (models) card.appendChild(models);
+    // Prepaid API credit (accounts[].credit): the share of it spent this
+    // cycle as a bar, its renewal as the bar's countdown, and the amount left
+    // with where the figure comes from — the same words the status command prints.
+    if (a.credit) {
+      card.appendChild(quotaRow('Credit', a.credit.usedFraction, a.credit.cycleEnd));
+      var creditLine = creditText(a.credit, Date.now());
+      if (creditLine) card.appendChild(el('div', 'usage', 'credit: ' + creditLine));
+    }
     // Spend on this account that did not come through the proxy (#475).
     var outside = outsideSpendText(q.outsideSpend);
     if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
@@ -1407,6 +1493,8 @@ ${SHARED_HELPERS}
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
     var pinsText = sessionPinsText(s.sessionPins);
     if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
+    var fleetText = fleetForecastText(s.fleetForecast, Date.now());
+    if (fleetText) sum.appendChild(el('span', '', ' · ' + fleetText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
@@ -1414,10 +1502,23 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     var now = Date.now();
-    (s.accounts || []).forEach(function (a) {
-      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
-      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+    var groups = accountGroups(s.accounts);
+    groups.forEach(function (g) {
+      var box = acc;
+      if (groups.length > 1) {
+        box = el('section', 'acctgroup');
+        var head = el('div', 'acctgroup-head');
+        head.appendChild(el('span', 'name', g.label));
+        var cur = currentAccounts && currentAccounts[g.provider];
+        head.appendChild(el('span', 'tag', g.accounts.length + (g.accounts.length === 1 ? ' account' : ' accounts') + (cur ? ' · current ' + cur : '')));
+        box.appendChild(head);
+        acc.appendChild(box);
+      }
+      g.accounts.forEach(function (a) {
+        var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+        if (cn) box.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+        box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+      });
     });
     renderProblems(s);
     renderRoutes(s);
