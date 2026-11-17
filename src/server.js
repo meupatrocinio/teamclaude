@@ -29,6 +29,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
+import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt } from './handoff-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -2991,6 +2992,34 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // handoffBeforeSwitch (IPM fork, on unless `false`): the seat-bound
+      // counterpart of the ask above. A large conversation whose pinned seat
+      // account is near a quota window, on a multi-account seat under
+      // `recommend` with a sibling that could take over, is answered once with
+      // an actionable 429 recommending /ipm:handoff while the pinned account
+      // still serves it warm. Nothing is forwarded. Never for an explicit
+      // account pin, a request the gate keeps out of session affinity, or a
+      // worker (x-teamclaude-worker-id): nobody reads its 429, so the ask
+      // would only stop it a turn before the limit would.
+      const handoffAsk = bound && bound.indices.length >= 2 && pinnedIndex == null && !noAffinity && !workerId && sessionId && pinKey && provider === DEFAULT_PROVIDER
+        ? handoffAskFor(accountManager, config, { method: req.method, url: req.url, body, pinKey, sessionId, model, advisorModel, bound })
+        : null;
+      if (handoffAsk && !res.headersSent && !clientGone(res)) {
+        const { account, window: near, sibling, settings, asks, route } = handoffAsk;
+        // Recorded before the answer is written: the next prompt of this
+        // conversation (the handoff itself) must find the record and go
+        // through to the warm account.
+        asks.record(handoffAsk.pinKey, handoffAsk.sessionId, body.length, settings.cooldownMs);
+        const answer = handoffAskAnswer({ account: account.name, window: near, sibling, cooldownMs: settings.cooldownMs });
+        res.writeHead(answer.status, answer.headers);
+        res.end(answer.body);
+        console.log(`[TeamClaude] Asked session ${handoffAsk.sessionId.slice(0, 8)} on seat "${safeLine(route, 64)}" to hand off before "${safeLine(account.name, 64)}" runs out: ${near.bucket} is at ${Math.round(/** @type {number} */ (near.utilization) * 100)}%, "${safeLine(sibling, 64)}" could take over, request body ${body.length} bytes. Answered 429 here; nothing was sent upstream (handoffBeforeSwitch)`);
+        recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(handoff before switch: ${safeLine(account.name, 64)})`, status: 429, model, effort, sessionId, pinned: false, client: req.tcClient ?? forcedClient ?? null, seat: route });
+        return;
+      }
+
       // AI-1960 (contract W2): admit the worker scope under the per-client and
       // global caps BEFORE the session begins, and before the usage recorder
       // books the request — a refused request is booked nowhere, like the
@@ -3308,6 +3337,62 @@ function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey,
     return { account, window: /** @type {any} */ (decision.window), settings, asks, pinKey, sessionId };
   } catch (/** @type {any} */ err) {
     reportFailure('[TeamClaude] compactBeforeSwitch: the decision failed, forwarding the request:', err);
+    return null;
+  }
+}
+
+/**
+ * Whether this seat-bound request is the one its conversation is told to hand
+ * off on (`handoffBeforeSwitch`, IPM fork): the pinned account, its nearest
+ * window, the sibling that would take over and the settings in force, or null
+ * to forward the request as usual.
+ *
+ * Gathers the facts only the server has and hands them to the pure decision in
+ * handoff-before-switch.js. The caller has already established a seat of two
+ * or more accounts, no explicit account pin, a client session and the
+ * Anthropic path. Here:
+ *   - the body size is tested first, so a short request costs one comparison;
+ *   - only a completion (`POST /v1/messages`);
+ *   - the pin is read the way pickBoundAccount reads it, and must be one of
+ *     the seat's accounts that supports the model and the advisor model;
+ *   - the sibling is the one the seat queue would offer after the limit
+ *     (nextInSeatQueueIndex);
+ *   - last, only when the body's last message is a typed user prompt, not a
+ *     tool turn (lastMessageIsTypedPrompt).
+ *
+ * Decides and reads; the caller records the ask. Any throw forwards the request.
+ *
+ * @param {any} accountManager
+ * @param {any} config
+ * @param {{ method: string|undefined, url: string|undefined, body: Buffer, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null, bound: { route: string, indices: number[], policies: Map<number, 'force'|'recommend'> } }} request
+ * @returns {{ account: Record<string, any>, window: import('./handoff-before-switch.js').QuotaWindow, sibling: string, settings: import('./handoff-before-switch.js').HandoffSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string, route: string }|null}
+ */
+function handoffAskFor(accountManager, config, { method, url, body, pinKey, sessionId, model, advisorModel, bound }) {
+  try {
+    const bodyBytes = body.length;
+    const settings = resolveHandoffBeforeSwitch(config?.handoffBeforeSwitch);
+    if (!settings || bodyBytes < settings.minBodyBytes) return null;
+    if (method !== 'POST' || !String(classificationPath(url) || '').split('?')[0].endsWith('/v1/messages')) return null;
+    const asks = accountManager.handoffAsks;
+    if (!asks) return null;
+    const bucket = accountManager._weeklyBucketFor?.(model) ?? weeklyBucketForModel(model);
+    const pinIdx = accountManager.sessionTracker.pinnedAccount(pinKey, bucket);
+    const pinned = pinIdx != null && bound.indices.includes(pinIdx) ? pinIdx : null;
+    const account = pinned == null ? null : accountManager.accounts[pinned];
+    if (!account || !accountSupportsModel(account, model) || !accountSupportsModel(account, advisorModel)) return null;
+    const next = nextInSeatQueueIndex(accountManager, bound.indices, pinned, model, advisorModel);
+    const sibling = next == null ? null : accountManager.accounts[next]?.name ?? null;
+    const decision = decideHandoffBeforeSwitch({
+      settings, bodyBytes, pinKey, sessionId, asks, pinned, sibling,
+      policy: seatPolicyFor({ bound }, pinned),
+      verdict: seatVerdict(accountManager, account, model, advisorModel),
+      windows: handoffWindows(accountManager, account, model),
+    });
+    if (!decision.ask || !decision.window || !sibling) return null;
+    if (!lastMessageIsTypedPrompt(body)) return null;
+    return { account, window: decision.window, sibling, settings, asks, pinKey, sessionId, route: bound.route };
+  } catch (/** @type {any} */ err) {
+    reportFailure('[TeamClaude] handoffBeforeSwitch: the decision failed, forwarding the request:', err);
     return null;
   }
 }
@@ -4667,8 +4752,9 @@ function seatPolicyFor(ctx, accountIndex) {
  * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
  * When the request was pinned to one account of a multi-account seat
  * (ctx.boundPinned) and that account is spent, the answer names the next
- * servable account in the seat's queue, so the user can hand off to a fresh
- * session there instead of dragging the whole conversation onto a cold cache.
+ * servable account in the seat's queue and the choices: continue this
+ * conversation there with a cold cache, start a new conversation, or wait for
+ * the pinned account to reset.
  * @param {any} res
  * @param {Record<string, any>} ctx
  * @param {import('./client-routes.js').SeatVerdict} verdict

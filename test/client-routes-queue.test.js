@@ -6,8 +6,9 @@ import { createProxyServer } from '../src/server.js';
 import { recordSeatRejection, seatVerdict } from '../src/client-routes.js';
 
 // The seat queue (IPM fork): a multi-account seat is a drain queue in config
-// order. The first quota failure on a pinned conversation recommends a handoff
-// and discloses the cold-cache continuation; the next prompt in that same
+// order. The first quota failure on a pinned conversation offers the choices
+// (continue cold, start a new conversation, or wait for the reset) and
+// discloses the cold-cache continuation; the next prompt in that same
 // conversation confirms it and moves once. A fresh conversation still advances
 // without that ceremony. Quota is spent one account at a time, not spread.
 
@@ -114,7 +115,7 @@ test('fresh conversations drain the queue head too — quota is not spread acros
   });
 });
 
-test('a spent pin offers handoff first; the next same-conversation prompt continues cold on the sibling', async () => {
+test('a spent pin offers the choices first; the next same-conversation prompt continues cold on the sibling', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
@@ -126,7 +127,9 @@ test('a spent pin offers handoff first; the next same-conversation prompt contin
     assert.equal(stopped.json?.error?.type, 'rate_limit_error');
     const msg = stopped.json?.error?.message ?? '';
     assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
-    assert.ok(msg.includes('/ipm:handoff'), `the handoff is not recommended: ${msg}`);
+    assert.ok(!msg.includes('/ipm:handoff'), `a handoff after the limit would confirm the continuation: ${msg}`);
+    assert.ok(msg.includes('start a new conversation'), `the fresh-conversation choice is missing: ${msg}`);
+    assert.ok(msg.includes('wait for "qa" to reset at '), `the reset choice is missing: ${msg}`);
     assert.ok(msg.includes('reprocess the full conversation at full input-token cost'), `the cold-cache cost is not disclosed: ${msg}`);
     assert.ok(msg.includes('next prompt confirms'), `the continuation is not disclosed: ${msg}`);
     assert.equal(stopped.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'the offer must not become the generic plan-limit banner');
@@ -171,7 +174,7 @@ test('a continuation offer requires the next account to serve the advisor model 
   });
 });
 
-test('a recorded rejection offers handoff before the next prompt switches', async () => {
+test('a recorded rejection offers the choices before the next prompt switches', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
     assert.equal((await send({ text: 'first' })).status, 200);

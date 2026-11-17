@@ -1,0 +1,463 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+import { CompactAsks } from '../src/compact-before-switch.js';
+import { keyHashOf, recordSeatRejection } from '../src/client-routes.js';
+import {
+  resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffAskAnswer, handoffBeforeSwitchStatus,
+  handoffWindows, lastMessageIsTypedPrompt, relativeTime, windowLabel,
+  DEFAULT_UTILIZATION, DEFAULT_MIN_BODY_BYTES, DEFAULT_COOLDOWN_SECONDS,
+} from '../src/handoff-before-switch.js';
+
+// handoffBeforeSwitch (IPM fork): a large seat-bound conversation whose pinned
+// account is near a quota window is told once, while that account still serves
+// it warm, to run /ipm:handoff. The setting, the decision and the answer
+// without a server first, then the request path against a stub upstream.
+
+const HOUR = 3600_000;
+const MINUTE = 60_000;
+const DEFAULTS = { utilization: DEFAULT_UTILIZATION, minBodyBytes: DEFAULT_MIN_BODY_BYTES, cooldownMs: DEFAULT_COOLDOWN_SECONDS * 1000 };
+
+// ── the setting ──────────────────────────────────────────────────────────────
+
+test('the setting is on by default and only false turns it off', () => {
+  assert.deepEqual(DEFAULTS, { utilization: 0.9, minBodyBytes: 200_000, cooldownMs: 1_800_000 });
+  for (const raw of [undefined, null, true, {}, 'yes', 1, []]) {
+    assert.deepEqual(resolveHandoffBeforeSwitch(raw), DEFAULTS, `${JSON.stringify(raw)} is on with the defaults`);
+  }
+  assert.equal(resolveHandoffBeforeSwitch(false), null);
+});
+
+test('an object tunes each field, and a field that is not a usable number takes its default', () => {
+  assert.deepEqual(
+    resolveHandoffBeforeSwitch({ utilization: 0.8, minBodyBytes: 1000, cooldownSeconds: 60 }),
+    { utilization: 0.8, minBodyBytes: 1000, cooldownMs: 60_000 },
+  );
+  for (const utilization of [0, 1, -0.1, 2, '0.8', NaN, null]) {
+    assert.equal(resolveHandoffBeforeSwitch({ utilization })?.utilization, DEFAULT_UTILIZATION, `utilization ${utilization}`);
+  }
+  for (const v of [0, -1, '1000', Infinity, null]) {
+    assert.equal(resolveHandoffBeforeSwitch({ minBodyBytes: v })?.minBodyBytes, DEFAULT_MIN_BODY_BYTES, `minBodyBytes ${v}`);
+    assert.equal(resolveHandoffBeforeSwitch({ cooldownSeconds: v })?.cooldownMs, DEFAULT_COOLDOWN_SECONDS * 1000, `cooldownSeconds ${v}`);
+  }
+});
+
+test('status reports the setting as resolved and the count asked', () => {
+  assert.deepEqual(handoffBeforeSwitchStatus(undefined, null), { enabled: true, utilization: 0.9, minBodyBytes: 200_000, cooldownSeconds: 1800, asked: 0 });
+  assert.deepEqual(handoffBeforeSwitchStatus(false, { asked: 3 }), { enabled: false, asked: 3 });
+  assert.deepEqual(handoffBeforeSwitchStatus({ utilization: 0.85, cooldownSeconds: 60 }, { asked: 1 }), { enabled: true, utilization: 0.85, minBodyBytes: 200_000, cooldownSeconds: 60, asked: 1 });
+});
+
+// ── the decision ─────────────────────────────────────────────────────────────
+
+const NOW = 10_000_000;
+
+// The facts of a request that is asked; each test changes one.
+function facts(over = {}) {
+  return {
+    settings: DEFAULTS,
+    bodyBytes: 250_000,
+    pinKey: 'sess~conv',
+    sessionId: 'sess',
+    pinned: 0,
+    policy: /** @type {'recommend'|'force'} */ ('recommend'),
+    verdict: null,
+    windows: [
+      { bucket: 'unified5h', utilization: 0.93, resetsAt: NOW + 72 * MINUTE },
+      { bucket: 'unified7d', utilization: 0.40, resetsAt: NOW + 3 * 24 * HOUR },
+    ],
+    sibling: 'qb',
+    asks: new CompactAsks({ now: () => NOW }),
+    ...over,
+  };
+}
+
+test('a large conversation near its 5-hour window, with a sibling, is asked', () => {
+  const d = decideHandoffBeforeSwitch(facts());
+  assert.equal(d.ask, true);
+  assert.equal(d.reason, 'near-limit');
+  assert.equal(d.window?.bucket, 'unified5h');
+});
+
+test('the nearest window is the one named', () => {
+  const d = decideHandoffBeforeSwitch(facts({ windows: [
+    { bucket: 'unified5h', utilization: 0.91, resetsAt: null },
+    { bucket: 'unified7d', utilization: 0.97, resetsAt: null },
+  ] }));
+  assert.equal(d.window?.bucket, 'unified7d');
+});
+
+test('each condition that fails forwards the request, with its reason', () => {
+  const cases = /** @type {[Record<string, any>, string][]} */ ([
+    [{ settings: null }, 'off'],
+    [{ sessionId: null }, 'no-session'],
+    [{ pinKey: null }, 'no-session'],
+    [{ bodyBytes: 199_999 }, 'small-body'],
+    [{ pinned: null }, 'not-pinned'],
+    [{ policy: 'force' }, 'force'],
+    [{ verdict: { kind: 'spent' } }, 'cannot-serve'],
+    [{ windows: [{ bucket: 'unified5h', utilization: 0.5, resetsAt: null }] }, 'not-near'],
+    [{ windows: [{ bucket: 'unified5h', utilization: null, resetsAt: null }] }, 'not-near'],
+    [{ windows: [] }, 'not-near'],
+    // A reading whose window already turned over says nothing about now.
+    [{ windows: [{ bucket: 'unified5h', utilization: 0.95, resetsAt: NOW - 1 }] }, 'not-near'],
+    [{ sibling: null }, 'no-sibling'],
+  ]);
+  for (const [over, reason] of cases) {
+    const d = decideHandoffBeforeSwitch(facts(over));
+    assert.deepEqual({ ask: d.ask, reason: d.reason }, { ask: false, reason }, JSON.stringify(over));
+  }
+});
+
+test('a conversation is asked once per cooldown and a session once per gap', () => {
+  const asks = new CompactAsks({ now: () => NOW });
+  assert.equal(decideHandoffBeforeSwitch(facts({ asks })).ask, true);
+  asks.record('sess~conv', 'sess', 250_000, DEFAULTS.cooldownMs);
+  assert.equal(decideHandoffBeforeSwitch(facts({ asks })).reason, 'conversation-cooldown');
+  assert.equal(decideHandoffBeforeSwitch(facts({ asks, pinKey: 'sess~other' })).reason, 'session-gap');
+  assert.equal(decideHandoffBeforeSwitch(facts({ asks, now: NOW + DEFAULTS.cooldownMs })).ask, true);
+});
+
+// ── the answer ───────────────────────────────────────────────────────────────
+
+test('relative times and window names read as a person writes them', () => {
+  assert.equal(relativeTime(NOW + 30_000, NOW), 'less than a minute');
+  assert.equal(relativeTime(NOW + 12 * MINUTE, NOW), '12m');
+  assert.equal(relativeTime(NOW + 72 * MINUTE, NOW), '1h 12m');
+  assert.equal(relativeTime(NOW + 2 * HOUR, NOW), '2h');
+  assert.equal(relativeTime(NOW + 76 * HOUR, NOW), '3d 4h');
+  assert.equal(windowLabel('unified5h'), '5-hour');
+  assert.equal(windowLabel('unified7d'), 'weekly');
+  assert.equal(windowLabel('unified7dFable'), 'weekly Fable');
+});
+
+test('the answer is an actionable 429 naming the account, window, reset, sibling and choices', () => {
+  const answer = handoffAskAnswer({ account: 'qa', window: { bucket: 'unified5h', utilization: 0.93, resetsAt: NOW + 72 * MINUTE }, sibling: 'qb', cooldownMs: 1_800_000, now: NOW });
+  assert.equal(answer.status, 429);
+  assert.deepEqual(answer.headers, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+  const body = JSON.parse(answer.body);
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'rate_limit_error');
+  const msg = body.error.message;
+  assert.ok(msg.startsWith('The account "qa", pinned to this conversation, is at 93% of its 5-hour quota (resets in 1h 12m).'), msg);
+  assert.match(msg, /"qb" appears available/);
+  assert.match(msg, /run \/ipm:handoff/);
+  assert.match(msg, /send any prompt to keep going here on "qa"/);
+  assert.match(msg, /not be asked again for 30 minutes/);
+
+  const noReset = JSON.parse(handoffAskAnswer({ account: 'qa', window: { bucket: 'unified7d', utilization: 0.951, resetsAt: null }, sibling: 'qb', cooldownMs: 60_000, now: NOW }).body).error.message;
+  assert.ok(noReset.startsWith('The account "qa", pinned to this conversation, is at 95% of its weekly quota. '), noReset);
+  assert.match(noReset, /for 1 minute\./);
+});
+
+test('the windows carry the 5-hour and governing weekly resets', () => {
+  const am = new AccountManager([{ name: 'qa', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR }], 0.98);
+  const a = am.accounts[0];
+  Object.assign(a.quota, { unified5h: 0.93, unified5hReset: NOW + HOUR, unified7d: 0.4, unified7dReset: NOW + 2 * HOUR });
+  assert.deepEqual(handoffWindows(am, a, 'claude-opus-4-1'), [
+    { bucket: 'unified5h', utilization: 0.93, resetsAt: NOW + HOUR },
+    { bucket: 'unified7d', utilization: 0.4, resetsAt: NOW + 2 * HOUR },
+  ]);
+});
+
+test('each weekly bucket is its own window: a shared weekly above the Fable bucket is shown with its own reset', () => {
+  const am = new AccountManager([{ name: 'qa', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR }], 0.98);
+  const a = am.accounts[0];
+  Object.assign(a.quota, {
+    unified5h: 0.2, unified5hReset: NOW + HOUR,
+    unified7d: 0.96, unified7dReset: NOW + 30 * HOUR,
+    unified7dFable: 0.91, unified7dFableReset: NOW + 50 * HOUR,
+  });
+  const windows = handoffWindows(am, a, 'claude-fable-5');
+  assert.deepEqual(windows, [
+    { bucket: 'unified5h', utilization: 0.2, resetsAt: NOW + HOUR },
+    { bucket: 'unified7d', utilization: 0.96, resetsAt: NOW + 30 * HOUR },
+    { bucket: 'unified7dFable', utilization: 0.91, resetsAt: NOW + 50 * HOUR },
+  ]);
+  const d = decideHandoffBeforeSwitch(facts({ windows }));
+  assert.deepEqual(d.window, { bucket: 'unified7d', utilization: 0.96, resetsAt: NOW + 30 * HOUR });
+  const msg = JSON.parse(handoffAskAnswer({ account: 'qa', window: /** @type {any} */ (d.window), sibling: 'qb', cooldownMs: 1_800_000, now: NOW }).body).error.message;
+  assert.match(msg, /is at 96% of its weekly quota \(resets in 1d 6h\)/);
+});
+
+test('only a typed user prompt is a handoff moment, never a tool turn', () => {
+  const body = (/** @type {any} */ last) => JSON.stringify({ messages: [{ role: 'user', content: 'task' }, { role: 'assistant', content: 'ok' }, last] });
+  assert.equal(lastMessageIsTypedPrompt(body({ role: 'user', content: 'go on' })), true, 'string content is typed');
+  assert.equal(lastMessageIsTypedPrompt(Buffer.from(body({ role: 'user', content: [{ type: 'text', text: 'go on' }] }))), true);
+  assert.equal(lastMessageIsTypedPrompt(body({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] })), false);
+  assert.equal(lastMessageIsTypedPrompt(body({ role: 'user', content: [{ type: 'text', text: 'and' }, { type: 'tool_result', tool_use_id: 't1', content: 'x' }] })), false);
+  assert.equal(lastMessageIsTypedPrompt(body({ role: 'assistant', content: 'prefill' })), false);
+  assert.equal(lastMessageIsTypedPrompt('{"messages":[]}'), false);
+  assert.equal(lastMessageIsTypedPrompt('{not json'), false);
+});
+
+// ── the request path ─────────────────────────────────────────────────────────
+
+const listen = (/** @type {http.Server} */ s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(/** @type {any} */ (s.address()).port)));
+const sec = (/** @type {number} */ ms) => String(Math.floor(ms / 1000));
+const ADMIN = 'admin-key';
+const KEYS = { amy: 'amy-key', ben: 'ben-key' };
+const oauth = (/** @type {string} */ name) => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR });
+const ROUTES = [
+  { name: 's1+s2+s3', clients: ['amy'], accounts: ['qa', 'qb', 'qc'] },
+  { name: 'seat-r', clients: ['ben'], accounts: ['qr'] },
+];
+const okBody = JSON.stringify({ id: 'msg_1', type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } });
+const LARGE = 210_000;
+
+/**
+ * A gateway with a three-account seat (amy) and a one-account seat (ben) in
+ * front of a stub upstream. `five[name]` is the 5-hour utilization the stub
+ * reports for that account on every answer, so a reading arrives the way a
+ * real one does.
+ * @param {{ five?: Record<string, number>, config?: Record<string, any>, policies?: any[] }} opts
+ * @param {(h: { send: (r?: Record<string, any>) => Promise<any>, seen: string[], am: any, config: Record<string, any>, logs: string[], ends: any[] }) => Promise<void>} fn
+ */
+async function withGateway({ five = { qa: 0.93 }, config: extra = {}, policies } = {}, fn) {
+  /** @type {string[]} */
+  const seen = [];
+  const upstream = http.createServer(async (req, res) => {
+    req.resume();
+    await new Promise(r => req.on('end', r));
+    const who = String(req.headers.authorization || '').replace(/^Bearer t-/, '');
+    seen.push(who);
+    /** @type {Record<string, string>} */
+    const headers = { 'content-type': 'application/json' };
+    if (five[who] != null) {
+      headers['anthropic-ratelimit-unified-5h-utilization'] = String(five[who]);
+      headers['anthropic-ratelimit-unified-5h-reset'] = sec(Date.now() + 2 * HOUR);
+    }
+    res.writeHead(200, headers);
+    res.end(okBody);
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauth('qa'), oauth('qb'), oauth('qc'), oauth('qr')], 0.98, {
+    clientRoutes: ROUTES,
+    continuationPolicies: policies,
+    distributeSessions: true,
+    refreshFn: async () => { throw new Error('no refresh'); },
+  });
+  const config = {
+    proxy: { apiKey: ADMIN, clientKeys: Object.entries(KEYS).map(([name, key]) => ({ name, key })), requireClientRoute: true },
+    upstream: `http://127.0.0.1:${upPort}`,
+    ...extra,
+  };
+  /** @type {any[]} */
+  const ends = [];
+  const proxy = createProxyServer(am, config, { onRequestEnd: (/** @type {number} */ _id, /** @type {any} */ info) => ends.push(info) });
+  const port = await listen(proxy);
+  /** @type {string[]} */
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  // One turn of one conversation, named by its opening; `pad` sizes the body.
+  const send = async ({ key = KEYS.amy, session = 's-1', opening = 'first task', pad = LARGE, policy, worker, path = '/v1/messages', last = { role: 'user', content: 'go on' } } = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'x-claude-code-session-id': session,
+        ...(policy === undefined ? {} : { 'x-teamclaude-seat-policy': policy }),
+        ...(worker === undefined ? {} : { 'x-teamclaude-worker-id': worker }),
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-1',
+        messages: [
+          { role: 'user', content: opening },
+          { role: 'assistant', content: 'x'.repeat(pad) },
+          last,
+        ],
+      }),
+    });
+    const raw = await res.text();
+    let json = null;
+    try { json = JSON.parse(raw); } catch { /* not JSON */ }
+    return { status: res.status, headers: res.headers, raw, json };
+  };
+  try {
+    await fn({ send, seen, am, config, logs, ends });
+  } finally {
+    console.log = origLog;
+    proxy.closeAllConnections?.(); proxy.close();
+    upstream.closeAllConnections?.(); upstream.close();
+  }
+}
+
+test('near, large, recommend: one 429 handoff ask, nothing upstream; the next prompt reaches the warm account', async () => {
+  await withGateway({}, async ({ send, seen, am, logs }) => {
+    assert.equal((await send()).status, 200, 'the first turn pins the conversation and reads qa at 93%');
+    assert.deepEqual(seen, ['qa']);
+
+    const asked = await send();
+    assert.equal(asked.status, 429);
+    assert.equal(asked.headers.get('x-should-retry'), 'false');
+    assert.equal(asked.headers.get('anthropic-ratelimit-unified-status'), null, 'no unified headers: Claude Code must show the text');
+    assert.equal(asked.json?.error?.type, 'rate_limit_error');
+    const msg = asked.json?.error?.message ?? '';
+    assert.match(msg, /^The account "qa", pinned to this conversation, is at 93% of its 5-hour quota \(resets in (1h 5\dm|2h)\)\./);
+    assert.match(msg, /"qb" appears available/);
+    assert.match(msg, /\/ipm:handoff/);
+    assert.deepEqual(seen, ['qa'], 'the ask was sent upstream');
+    assert.equal(am.handoffAsks.asked, 1);
+    assert.ok(logs.some(l => l.includes('to hand off before "qa" runs out') && l.includes('(handoffBeforeSwitch)')), logs.join('\n'));
+
+    const next = await send();
+    assert.equal(next.status, 200, 'the follow-up prompt is forwarded');
+    assert.deepEqual(seen, ['qa', 'qa'], 'the follow-up went to qa, not qb');
+    assert.equal(next.headers.get('x-teamclaude-seat-failover'), null);
+    assert.equal((await send()).status, 200, 'still within the cooldown');
+    assert.deepEqual(seen, ['qa', 'qa', 'qa']);
+  });
+});
+
+test('a worker (x-teamclaude-worker-id) is never asked: nobody reads its 429', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    const worker = `w1_${'ab'.repeat(16)}`;
+    assert.equal((await send({ worker })).status, 200);
+    assert.equal((await send({ worker })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+  });
+});
+
+test('below the utilization: forwarded', async () => {
+  await withGateway({ five: { qa: 0.5 } }, async ({ send, seen }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+});
+
+test('a small body: forwarded', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ pad: 1000 })).status, 200);
+    assert.equal((await send({ pad: 2000 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+});
+
+test('force, by header or by owner root: forwarded', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ policy: '*=force' })).status, 200);
+    assert.equal((await send({ policy: '*=force' })).status, 200, 'header force');
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+  const policies = [{ client: 'amy', keyHash: keyHashOf(KEYS.amy), mode: 'force', revision: 'r_one' }];
+  await withGateway({ policies }, async ({ send, seen }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200, 'root force');
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+});
+
+test('no sibling can serve: forwarded', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    for (const i of [1, 2]) {
+      recordSeatRejection(am.accounts[i], {
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-7d-status': 'rejected',
+        'anthropic-ratelimit-unified-7d-reset': sec(Date.now() + HOUR),
+      }, 'claude-opus-4-1');
+    }
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+});
+
+test('a single-account seat: forwarded', async () => {
+  await withGateway({ five: { qr: 0.95 } }, async ({ send, seen }) => {
+    assert.equal((await send({ key: KEYS.ben })).status, 200);
+    assert.equal((await send({ key: KEYS.ben })).status, 200);
+    assert.deepEqual(seen, ['qr', 'qr']);
+  });
+});
+
+test('disabled, including by a reload of the live config: forwarded', async () => {
+  await withGateway({ config: { handoffBeforeSwitch: false } }, async ({ send, seen }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+  await withGateway({}, async ({ send, seen, config }) => {
+    assert.equal((await send()).status, 200);
+    // What POST /teamclaude/reload does: the key is reassigned on the shared object.
+    config.handoffBeforeSwitch = false;
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+    config.handoffBeforeSwitch = { utilization: 0.92 };
+    assert.equal((await send()).status, 429, 'turned back on and tuned by the next reload');
+  });
+});
+
+test('a tuned utilization and body size apply', async () => {
+  await withGateway({ five: { qa: 0.85 }, config: { handoffBeforeSwitch: { utilization: 0.8, minBodyBytes: 5000 } } }, async ({ send, seen }) => {
+    assert.equal((await send({ pad: 6000 })).status, 200);
+    assert.equal((await send({ pad: 6000 })).status, 429);
+    assert.deepEqual(seen, ['qa']);
+  });
+});
+
+test('a tool_result turn is forwarded; the next typed prompt is asked', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    const tool = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] };
+    assert.equal((await send({ last: tool })).status, 200, 'mid-task: forwarded');
+    assert.deepEqual(seen, ['qa', 'qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+    assert.equal((await send()).status, 429, 'the typed prompt is asked');
+    assert.equal(am.handoffAsks.asked, 1);
+  });
+});
+
+test('a spent pinned account gets the post-limit offer, not the ask', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    recordSeatRejection(am.accounts[0], {
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+      'anthropic-ratelimit-unified-7d-reset': sec(Date.now() + HOUR),
+    }, 'claude-opus-4-1');
+    const offer = await send();
+    assert.equal(offer.status, 429);
+    assert.match(offer.json?.error?.message ?? '', /next prompt confirms/);
+    assert.doesNotMatch(offer.json?.error?.message ?? '', /\/ipm:handoff/);
+    assert.deepEqual(seen, ['qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+  });
+});
+
+test('count_tokens is forwarded and does not use up the ask', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send({ path: '/v1/messages/count_tokens' })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+    assert.equal((await send()).status, 429, 'the next completion is still asked');
+  });
+});
+
+test('the ask closes its activity entry once, as a 429 on the seat', async () => {
+  await withGateway({}, async ({ send, ends }) => {
+    assert.equal((await send()).status, 200);
+    const before = ends.length;
+    assert.equal((await send()).status, 429);
+    const mine = ends.slice(before);
+    assert.equal(mine.length, 1, JSON.stringify(mine));
+    assert.equal(mine[0].status, 429);
+    assert.equal(mine[0].account, '(handoff before switch: qa)');
+    assert.equal(mine[0].seat, 's1+s2+s3');
+  });
+});
+
+test('an explicit account pin is never asked', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send({ path: '/tc-acct/qa/v1/messages' })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+  });
+});
