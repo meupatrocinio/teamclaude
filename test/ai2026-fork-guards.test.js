@@ -676,3 +676,88 @@ test('(k) affinity restore still drops an over-long client key and a key that on
   assert.equal(after.sessions.size, 1, 'only the real worker-scoped key comes back');
   assert.equal(after.pinnedAccount(goodWorker, 'unified7d'), 0);
 });
+
+// ── (l) a multi-account seat whose every account fails ─────────────────────
+
+// Measured on ipm.24 (b4d3a87) and on this branch with the same scenarios: a
+// bound request never reaches the fleet "all accounts exhausted" branch, so it
+// carries no #597 `details` and takes no #603/hold retry; it answers from the
+// seat (spent copy) or relays the seat account's own error, and never leaves
+// the seat. The bodies below are ipm.24's, byte for byte.
+const SEAT2 = [{ name: 'seat-a', clients: ['ana'], accounts: ['sa', 'sb'] }];
+const ERR_500 = '{"type":"error","error":{"type":"api_error","message":"Internal server error"}}';
+const ERR_529 = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+const spent = (/** @type {'5h'|'7d'} */ win, /** @type {number} */ ms) => (/** @type {any} */ res) => {
+  const reset = String(Math.floor((Date.now() + ms) / 1000));
+  res.writeHead(429, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-status': 'rejected', [`anthropic-ratelimit-unified-${win}-status`]: 'rejected', [`anthropic-ratelimit-unified-${win}-reset`]: reset, 'anthropic-ratelimit-unified-reset': reset });
+  res.end('{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}');
+};
+
+/**
+ * @param {(res: any) => void} fail every seat account's answer once failing
+ * @param {boolean} pinned warm the conversation onto the seat first
+ * @param {(r: { status: number, text: string, headers: any }[], seen: { who: string }[]) => void} check
+ */
+async function allSeatAccountsFail(fail, pinned, check) {
+  let failing = !pinned;
+  const handler = (/** @type {string} */ who, /** @type {any} */ _req, /** @type {any} */ res) => (who === 'sc' || !failing ? ok(res) : fail(res));
+  await withGateway({ routes: SEAT2, handler }, async ({ send, seen }) => {
+    /** @type {string[]} */
+    const logs = [];
+    const quiet = console.log;
+    console.log = (...a) => { logs.push(a.join(' ')); };
+    try {
+      const headers = pinned ? { 'x-claude-code-session-id': 'sess-l' } : {};
+      const body = JSON.stringify({ model: 'claude-opus-4-1', messages: [{ role: 'user', content: 'hi' }] });
+      if (pinned) assert.equal((await send({ key: KEYS.ana, headers, body })).status, 200);
+      seen.length = 0;
+      failing = true;
+      const t0 = Date.now();
+      const answers = [await send({ key: KEYS.ana, headers, body }), await send({ key: KEYS.ana, headers, body })];
+      assert.ok(Date.now() - t0 < 10_000, 'answered at once, no hold');
+      for (const a of answers) {
+        const parsed = JSON.parse(a.text);
+        assert.equal('details' in (parsed.error ?? {}), false, `no #597 details: ${a.text}`);
+        assert.ok(a.headers.get('x-teamclaude-request-id'), 'the #600 header is the one addition');
+      }
+      assert.ok(seen.every(s => s.who === 'sa' || s.who === 'sb'), `never outside the seat: ${JSON.stringify(seen)}`);
+      assert.deepEqual(logs.filter(l => /exhausted|holding connection/i.test(l)), [], 'never the fleet exhausted/hold branch');
+      check(answers, seen);
+    } finally {
+      console.log = quiet;
+    }
+  });
+}
+
+test('(l) a two-account seat whose accounts all answer 5xx relays the seat\'s own error, as ipm.24', async () => {
+  const e500 = (/** @type {any} */ res) => { res.writeHead(500, { 'content-type': 'application/json' }); res.end(ERR_500); };
+  const e529 = (/** @type {any} */ res) => { res.writeHead(529, { 'content-type': 'application/json' }); res.end(ERR_529); };
+  await allSeatAccountsFail(e500, false, (answers, seen) => {
+    assert.deepEqual(answers.map(a => [a.status, a.text]), [[500, ERR_500], [500, ERR_500]]);
+    assert.deepEqual(seen.map(s => s.who), ['sa', 'sb', 'sa', 'sb']);
+  });
+  await allSeatAccountsFail(e529, true, (answers, seen) => {
+    assert.deepEqual(answers.map(a => [a.status, a.text]), [[529, ERR_529], [529, ERR_529]]);
+    assert.deepEqual(seen.map(s => s.who), ['sa', 'sa'], 'the pinned account only');
+  });
+});
+
+test('(l) a two-account seat whose accounts are all spent answers the seat\'s 429 copy, as ipm.24', async () => {
+  await allSeatAccountsFail(spent('5h', HOUR), false, (answers, seen) => {
+    for (const a of answers) {
+      assert.equal(a.status, 429);
+      assert.equal(a.headers.get('x-should-retry'), 'false');
+      assert.equal(a.headers.get('anthropic-ratelimit-unified-5h-status'), 'rejected');
+      assert.match(JSON.parse(a.text).error.message, /^Your Claude seat "seat-a" is out of quota until \S+Z\. Use `cg kimi on` to keep working meanwhile\.$/);
+    }
+    assert.deepEqual(seen.map(s => s.who), ['sa', 'sb'], 'the second answer comes from the recording');
+  });
+  await allSeatAccountsFail(spent('7d', 48 * HOUR), true, (answers, seen) => {
+    assert.deepEqual(answers.map(a => a.status), [429, 429]);
+    assert.match(JSON.parse(answers[0].text).error.message, /^You can keep working by moving to another assigned account; "sb" appears available\. The account "sa", pinned to this conversation, cannot serve this request because its quota is exhausted until /);
+    assert.equal(answers[0].headers.get('anthropic-ratelimit-unified-status'), null, 'the continuation offer carries no unified headers');
+    assert.match(JSON.parse(answers[1].text).error.message, /^Your Claude seat "seat-a" is out of quota until \S+Z\. This conversation is pinned to "sb", and no other account on this seat can serve now\. Use `cg kimi on` to keep working meanwhile\.$/);
+    assert.equal(answers[1].headers.get('anthropic-ratelimit-unified-7d-status'), 'rejected');
+    assert.deepEqual(seen.map(s => s.who), ['sa', 'sb']);
+  });
+});
