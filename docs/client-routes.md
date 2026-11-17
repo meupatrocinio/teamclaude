@@ -150,6 +150,15 @@ copies of the internal policy/failover headers are discarded.
 
 A cordoned account (`teamclaude cordon`) inside a fixed seat keeps serving that seat: the seat belongs to the client, so a cordon takes no new fleet conversation onto the account but never empties the seat.
 
+Upstream's fleet re-routing never moves a request bound to a seat. Such a request takes no billing,
+account-refusal or model-unsupported failover and puts no billing cooldown on the account: upstream's
+answer is relayed as it was before (ipm.24). The tail of a list pin (`/tc-acct/a,b`) is dropped for a
+key on a route, and `compactBeforeSwitch` never asks a seat-bound request to compact. With
+`proxy.controlPlane` unset, `proxy.requireClientRoute: true` or a key on a route makes the control
+plane `"pool"`, so Claude Code's bootstrap, policy and registry calls go through the seat gate like
+inference, and a scope 403 on a seat account is answered from the seat, never relayed on the client's
+own login. An explicit `proxy.controlPlane` is honoured.
+
 Force applies only to genuine quota rejection. Throttling, credential/entitlement failures, 5xx,
 third-party 400s, stream failures, transport errors, operator caps, and token/routing failures never
 move a pinned conversation to a sibling. Fresh, unpinned conversations keep their ordinary queue
