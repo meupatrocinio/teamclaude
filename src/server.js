@@ -2312,14 +2312,39 @@ const CONTROL_PLANE_PATHS = [
 
 /**
  * Whether a classified path goes out on the client's own credential: below an
- * entry of CLIENT_CREDENTIAL_PATHS, or of CONTROL_PLANE_PATHS unless
- * `proxy.controlPlane` is "pool", or the collection that entry names.
+ * entry of CLIENT_CREDENTIAL_PATHS, or of CONTROL_PLANE_PATHS unless the
+ * effective control plane (effectiveControlPlane) is "pool", or the collection
+ * that entry names.
  * @param {string} path
  * @param {Record<string, any>|null|undefined} config  read per request
+ * @param {unknown} [controlPlane]  the effective `proxy.controlPlane`
  */
-function isClientCredentialPath(path, config) {
+function isClientCredentialPath(path, config, controlPlane = config?.proxy?.controlPlane) {
   const under = (/** @type {string[]} */ paths) => paths.some((p) => path.startsWith(p) || path === p.slice(0, -1));
-  return under(CLIENT_CREDENTIAL_PATHS) || (config?.proxy?.controlPlane !== 'pool' && under(CONTROL_PLANE_PATHS));
+  return under(CLIENT_CREDENTIAL_PATHS) || (controlPlane !== 'pool' && under(CONTROL_PLANE_PATHS));
+}
+
+/**
+ * The control plane a request is served under (IPM fork, AI-2026). An explicit
+ * `proxy.controlPlane` is honoured. Unset, a fixed-seat deployment keeps the
+ * ipm.24 path: with `proxy.requireClientRoute` on, or for a client key that is
+ * on a client route, the control-plane calls go through the pool and the seat
+ * gate ("pool"), as they did before upstream moved them onto the client's own
+ * login. Everyone else gets upstream's default.
+ * @param {Record<string, any>|null|undefined} config  read per request
+ * @param {any} accountManager
+ * @param {string|null} client  the authenticated client-key name, or null
+ * @returns {unknown}
+ */
+function effectiveControlPlane(config, accountManager, client) {
+  const explicit = config?.proxy?.controlPlane;
+  if (explicit !== undefined) return explicit;
+  if (config?.proxy?.requireClientRoute === true) return 'pool';
+  if (client) {
+    const on = routeForClient(accountManager?.clientRoutes, client);
+    if (on && ('route' in on || 'ambiguous' in on)) return 'pool';
+  }
+  return explicit;
 }
 
 /**
@@ -2662,7 +2687,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       const classifiedPath = classificationPath(req.url);
-      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
+      const controlPlane = effectiveControlPlane(config, accountManager, req.tcClient ?? forcedClient ?? null);
+      if (isClientCredentialPath(classifiedPath, config, controlPlane)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -2775,6 +2801,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             pinnedIndex = null;
             noAffinity = true;
           } else if (routed) {
+            // AI-2026 (fork wins over #645): a list pin's tail never applies
+            // to a key on a fixed seat. advancePinPastBilling would otherwise
+            // walk a `seat,other` pin off the seat on a billing refusal.
+            pinChain = null;
             const r = resolveClientRoute(accountManager, routed, resolveAccountPin);
             if (pinnedIndex != null && !r.indices.includes(pinnedIndex)) {
               const foreign = /** @type {any} */ (accountManager).accounts[pinnedIndex]?.name ?? null;
@@ -2935,8 +2965,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // request something pins to an account (TC_ACCT, `/tc-acct/`, which is
       // also how keep-warm sends, an operator session pin): a pinned request
       // does not rotate, so no switch is coming. Read live from the shared
-      // config, so a reload applies to the next request.
-      const compactAsk = /** @type {any} */ (config)?.compactBeforeSwitch && pinnedIndex == null && sessionId && pinKey && provider === DEFAULT_PROVIDER
+      // config, so a reload applies to the next request. Nor for a request
+      // bound to a fixed seat, or one the gate keeps out of session affinity
+      // (IPM fork, AI-2026): the switch threshold does not apply to a seat, so
+      // no fleet switch is coming and the 400 would be made up.
+      const compactAsk = /** @type {any} */ (config)?.compactBeforeSwitch && pinnedIndex == null && !bound && !noAffinity && sessionId && pinKey && provider === DEFAULT_PROVIDER
         ? compactAskFor(accountManager, config, { method: req.method, url: req.url, bodyBytes: body.length, pinKey, sessionId, model, advisorModel })
         : null;
       if (compactAsk && !res.headersSent && !clientGone(res)) {
@@ -5716,7 +5749,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     let upstreamBody = upstreamRes.body;
     // Only a JSON error is read ahead: any other 400 or 402 (an event stream, a
     // proxy's HTML page) is relayed as it arrives, not held until it ends.
+    // Not for a request bound to a fixed seat (IPM fork, AI-2026): no billing
+    // failover moves it off its seat, so upstream's answer is relayed as in
+    // ipm.24 and the account is not put in a billing cooldown by it.
     if ((upstreamRes.status === 400 || upstreamRes.status === 402) && !res.headersSent
+        && !ctx.bound && !ctx.boundPinned
         && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const inspected = await inspectBillingError(upstreamBody);
       upstreamBody = inspected.body;
@@ -6145,7 +6182,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // An account refusal (account-refusal.js) is about the account: it leaves
     // rotation and the request fails over, like the 403 below. Only a JSON
     // body is read, and it is teed, so an ordinary 400 is relayed whole.
+    // Neither this failover nor the model-unsupported one below applies to a
+    // request bound to a fixed seat (IPM fork, AI-2026): its answer is relayed
+    // as in ipm.24.
     if (upstreamRes.status === 400 && account.type === 'oauth' && upstreamBody && !res.headersSent
+        && !ctx.bound && !ctx.boundPinned
         && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const [peek, rest] = upstreamBody.tee();
       upstreamBody = rest;
