@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   approvalUrl, callbackBase, callbackClientId, CALLBACK_CLIENT_ID, loginCallback, refreshCallbackToken,
   getCallbackAuthPath, loadCallbackToken, saveCallbackToken, clearCallbackToken,
-  callbackCall, callbackWhoami, logoutCallback, callbackTokenLapsed,
+  callbackCall, callbackApi, callbackWhoami, logoutCallback, callbackTokenLapsed,
 } from '../src/callback-auth.js';
 
 // Sign-in to callback.net: a poll-token OAuth2 flow. The client asks for a poll
@@ -138,16 +138,14 @@ test('the approval URL is the API\'s own, or a short link only when it looks lik
 });
 
 test('the API origin can only be overridden to https, or to plain http on this machine', () => {
-  const warned = [];
-  const at = (v) => callbackBase(v === undefined ? {} : { TEAMCLAUDE_CALLBACK_API_BASE: v }, (m) => warned.push(m));
+  const at = (v) => callbackBase(v === undefined ? {} : { TEAMCLAUDE_CALLBACK_API_BASE: v });
   assert.equal(at(undefined), 'https://www.callback.net');
   assert.equal(at('https://staging.example.net/'), 'https://staging.example.net');
   assert.equal(at('http://127.0.0.1:8080'), 'http://127.0.0.1:8080');
-  assert.equal(warned.length, 0);
-  assert.equal(at('http://staging.example.net'), 'https://www.callback.net');
-  assert.equal(at('not a url'), 'https://www.callback.net');
-  assert.equal(warned.length, 2);
-  assert.match(warned[0], /must be https/);
+  // An override that is set but not acceptable is refused, never replaced by the
+  // default: that would send this install's token to a host it was not meant for.
+  assert.throws(() => at('http://staging.example.net'), /CALLBACK_API_BASE.*must be https/);
+  assert.throws(() => at('not a url'), /CALLBACK_API_BASE/);
   // The new prefix wins, as for every other variable.
   assert.equal(callbackBase({ TEAMROUTER_CALLBACK_API_BASE: 'https://a.example', TEAMCLAUDE_CALLBACK_API_BASE: 'https://b.example' }), 'https://a.example');
 });
@@ -171,7 +169,8 @@ test('sign-in polls until the approval arrives, then trades the code for a token
   });
   assert.deepEqual(urls, [['https://oid.jp/AbC123', 900]]);
   assert.equal(sleeps.length, 2, 'one pause per empty poll');
-  assert.deepEqual(token, { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 1_000_000 });
+  // Stamped with when it was signed in, which tells this sign-in from the next.
+  assert.deepEqual(token, { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 1_000_000, signed_in_at: 1_000_000 });
 
   const paths = api.state.seen.map((s) => s.path);
   assert.deepEqual(paths, [
@@ -245,7 +244,7 @@ test('the token is kept beside the config, private, and a damaged file reads as 
 test('an expired access token is renewed once, saved, and the call repeated', async (t) => {
   await tempConfig(t);
   const api = await mockApi(t, { access: 'at-current' });
-  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', client_id: CLIENT, obtained_at: 1 });
+  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', client_id: CLIENT, obtained_at: 1, signed_in_at: 1 });
 
   const me = await callbackWhoami({ base: api.base, now: () => 5 });
   // The display name carried a terminal escape; it does not reach the caller.
@@ -255,8 +254,9 @@ test('an expired access token is renewed once, saved, and the call repeated', as
     ['OAuth2:token', null],
     ['OAuth2:me', 'Bearer at-2'],
   ]);
-  // The refresh token was not restated by the server and is kept.
-  assert.deepEqual(await loadCallbackToken(), { access_token: 'at-2', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 5 });
+  // The refresh token was not restated by the server and is kept, and so is
+  // the sign-in it renews.
+  assert.deepEqual(await loadCallbackToken(), { access_token: 'at-2', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 5, signed_in_at: 1 });
 });
 
 test('a token near the end of its stated lifetime is renewed before the call, not after a refusal', async (t) => {
@@ -429,4 +429,22 @@ test('teamclaude callback: login prints the URL and saves the token, status name
   const bad = await runCli(configPath, api.base, ['frobnicate']);
   assert.equal(bad.code, 1);
   assert.match(bad.stderr, /Usage: teamclaude callback login/);
+});
+
+test('a CALLBACK_API_BASE that is set but not acceptable sends nothing, to the default or anywhere', async () => {
+  const before = process.env.TEAMROUTER_CALLBACK_API_BASE;
+  process.env.TEAMROUTER_CALLBACK_API_BASE = 'http://store.example.net';
+  const sent = [];
+  try {
+    const err = await callbackApi('GET', 'User/Credential', null, {
+      accessToken: 'our-token',
+      fetchImpl: async (url) => { sent.push(String(url)); throw new TypeError('fetch failed'); },
+    }).catch((e) => e);
+    assert.ok(err instanceof Error, 'the call is refused');
+    assert.match(err.message, /CALLBACK_API_BASE/);
+    assert.deepEqual(sent, [], 'and the token went nowhere');
+  } finally {
+    if (before === undefined) delete process.env.TEAMROUTER_CALLBACK_API_BASE;
+    else process.env.TEAMROUTER_CALLBACK_API_BASE = before;
+  }
 });
