@@ -52,6 +52,11 @@ export class ClaudeReauthFlows {
 
   async start(account) {
     this.expire();
+    // A `login --long-lived` entry (AI-2026) holds a one-year, inference-only
+    // token and no refresh token: the OAuth replacement this flow returns
+    // would turn it into a different kind of account. Refused before any
+    // OAuth state is opened.
+    if (account?.longLived === true) throw failure('long_lived_account', 409, 'a long-lived account is not reauthenticated through OAuth');
     if (this.flows.size >= MAX_FLOWS) throw failure('too_many_flows', 429, 'too many OAuth flows are open');
     const identity = renderedReauthIdentity(account);
     const controller = new AbortController();
