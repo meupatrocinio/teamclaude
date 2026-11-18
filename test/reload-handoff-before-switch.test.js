@@ -42,15 +42,15 @@ test('reload hot-applies a handoffBeforeSwitch edit, in both directions', async 
     }),
   });
   const { port, configPath } = server;
-  const defaults = { enabled: true, utilization: 0.9, minBodyBytes: 200000, cooldownSeconds: 1800, asked: 0 };
+  const defaults = { enabled: true, fiveHourUtilization: 0.75, weeklyUtilization: 0.9, minBodyBytes: 200000, cooldownSeconds: 1800, asked: 0 };
   try {
     assert.deepEqual(await handoffStatus(port), defaults, 'on unless set');
 
     await reloadWith(port, configPath, c => { c.handoffBeforeSwitch = false; });
     assert.deepEqual(await handoffStatus(port), { enabled: false, asked: 0 });
 
-    await reloadWith(port, configPath, c => { c.handoffBeforeSwitch = { utilization: 0.8, minBodyBytes: 'big', cooldownSeconds: 60 }; });
-    assert.deepEqual(await handoffStatus(port), { ...defaults, utilization: 0.8, cooldownSeconds: 60 }, 'a bad field takes its default');
+    await reloadWith(port, configPath, c => { c.handoffBeforeSwitch = { weeklyUtilization: 0.8, minBodyBytes: 'big', cooldownSeconds: 60 }; });
+    assert.deepEqual(await handoffStatus(port), { ...defaults, weeklyUtilization: 0.8, cooldownSeconds: 60 }, 'a bad field takes its default');
 
     await reloadWith(port, configPath, c => { delete c.handoffBeforeSwitch; });
     assert.deepEqual(await handoffStatus(port), defaults, 'removing the key turns it back on');

@@ -8,8 +8,8 @@
 // continuation it was meant to avoid. A handoff only helps while the pinned
 // account still serves, with the conversation in its prompt cache.
 //
-// So when a large seat-bound conversation's pinned account is near a quota
-// window and another account on the seat could take over, the proxy answers
+// So when a large seat-bound conversation's pinned account is past a handoff
+// threshold and another account on the seat could take over, the proxy answers
 // ONE request of that conversation itself, with an actionable 429 saying so.
 // Nothing is sent upstream. The ask is recorded before the answer is written,
 // so the next prompt of that conversation (the handoff, or the user carrying
@@ -17,23 +17,33 @@
 //
 // Upstream's compactBeforeSwitch (compact-before-switch.js) does the same job
 // for fleet rotation and stays off for seat-bound requests: a seat ignores the
-// switch threshold and runs until upstream rejects, so the threshold here is a
-// fixed utilization rather than `switchThreshold - margin`. The record of who
-// was asked is a CompactAsks of its own (AccountManager.handoffAsks).
+// switch threshold and runs until upstream rejects, so the thresholds here are
+// fixed utilizations rather than `switchThreshold - margin`: one for the
+// 5-hour window, lower because under parallel sessions it can burn from first
+// serve to spent in minutes, and one for every weekly window. The record of
+// who was asked is a CompactAsks of its own (AccountManager.handoffAsks).
+//
+// The same thresholds drive the soft drain (softDrainIndex): a conversation
+// with no pin on the seat starts on the first servable account past neither,
+// so the handoff's new conversation, and every new task, lands on a fresh
+// account while pinned conversations keep their warm one to the limit.
 //
 // This module holds the parts that need no server: the setting, the readings,
-// the decision and the answer. The server supplies the facts (server.js
+// the decision, the soft-drain pick and the answer. The server supplies the facts (server.js
 // handoffAskFor). Every doubt resolves to forwarding the request.
 
 import { safeLine } from './safe-text.js';
+import { seatVerdict } from './client-routes.js';
 
-export const DEFAULT_UTILIZATION = 0.9;
+export const DEFAULT_FIVE_HOUR_UTILIZATION = 0.75;
+export const DEFAULT_WEEKLY_UTILIZATION = 0.9;
 export const DEFAULT_MIN_BODY_BYTES = 200_000;
 export const DEFAULT_COOLDOWN_SECONDS = 1800;
 
 /**
  * @typedef {Object} HandoffSettings
- * @property {number} utilization   the reading at or above which a window is near (0-1)
+ * @property {number} fiveHourUtilization  the 5-hour reading at or above which an account is past (0-1)
+ * @property {number} weeklyUtilization    the weekly reading (shared, family, scoped) at or above which it is past (0-1)
  * @property {number} minBodyBytes  the smallest request body that is asked
  * @property {number} cooldownMs    how long one conversation is left alone after being asked
  */
@@ -55,8 +65,8 @@ function field(value, valid, fallback) {
  * On by default: the production renderer rebuilds the pool config and would
  * never emit a new pool-level key. Only `false` turns it off. An object tunes
  * it, each field that is not a usable number taking its default:
- * `utilization` above 0 and below 1, `minBodyBytes` and `cooldownSeconds`
- * above 0. Any other value (absent, `true`, a string) is on with the defaults.
+ * `fiveHourUtilization` and `weeklyUtilization` above 0 and below 1,
+ * `minBodyBytes` and `cooldownSeconds` above 0. Any other value (absent, `true`, a string) is on with the defaults.
  *
  * @param {unknown} raw
  * @returns {HandoffSettings|null}
@@ -65,7 +75,8 @@ export function resolveHandoffBeforeSwitch(raw) {
   if (raw === false) return null;
   const o = /** @type {Record<string, unknown>} */ (raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {});
   return {
-    utilization: field(o.utilization, n => n > 0 && n < 1, DEFAULT_UTILIZATION),
+    fiveHourUtilization: field(o.fiveHourUtilization, n => n > 0 && n < 1, DEFAULT_FIVE_HOUR_UTILIZATION),
+    weeklyUtilization: field(o.weeklyUtilization, n => n > 0 && n < 1, DEFAULT_WEEKLY_UTILIZATION),
     minBodyBytes: field(o.minBodyBytes, n => n > 0, DEFAULT_MIN_BODY_BYTES),
     cooldownMs: field(o.cooldownSeconds, n => n > 0, DEFAULT_COOLDOWN_SECONDS) * 1000,
   };
@@ -77,13 +88,13 @@ export function resolveHandoffBeforeSwitch(raw) {
  *
  * @param {unknown} raw  `config.handoffBeforeSwitch`
  * @param {{ asked?: number }|null|undefined} asks
- * @returns {{ enabled: boolean, utilization?: number, minBodyBytes?: number, cooldownSeconds?: number, asked: number }}
+ * @returns {{ enabled: boolean, fiveHourUtilization?: number, weeklyUtilization?: number, minBodyBytes?: number, cooldownSeconds?: number, asked: number }}
  */
 export function handoffBeforeSwitchStatus(raw, asks) {
   const settings = resolveHandoffBeforeSwitch(raw);
   const asked = asks?.asked ?? 0;
   if (!settings) return { enabled: false, asked };
-  return { enabled: true, utilization: settings.utilization, minBodyBytes: settings.minBodyBytes, cooldownSeconds: settings.cooldownMs / 1000, asked };
+  return { enabled: true, fiveHourUtilization: settings.fiveHourUtilization, weeklyUtilization: settings.weeklyUtilization, minBodyBytes: settings.minBodyBytes, cooldownSeconds: settings.cooldownMs / 1000, asked };
 }
 
 /**
@@ -142,6 +153,54 @@ export function lastMessageIsTypedPrompt(body) {
 }
 
 /**
+ * The window furthest past its own handoff threshold, or null when none is:
+ * the 5-hour window against `fiveHourUtilization`, every weekly one against
+ * `weeklyUtilization`. An unknown reading, or one whose window already reset,
+ * says nothing about now and is skipped.
+ *
+ * @param {QuotaWindow[]|null|undefined} windows
+ * @param {HandoffSettings} settings
+ * @param {number} now
+ * @returns {QuotaWindow|null}
+ */
+export function pastHandoffThreshold(windows, settings, now) {
+  /** @type {QuotaWindow|null} */
+  let best = null;
+  let bestOver = -Infinity;
+  for (const w of windows || []) {
+    const u = w.utilization;
+    if (typeof u !== 'number' || !Number.isFinite(u)) continue;
+    if (w.resetsAt != null && w.resetsAt <= now) continue;
+    const over = u - (w.bucket === 'unified5h' ? settings.fiveHourUtilization : settings.weeklyUtilization);
+    if (over >= 0 && over > bestOver) { best = w; bestOver = over; }
+  }
+  return best;
+}
+
+/**
+ * The soft drain: the account a conversation with no pin on a seat starts on,
+ * the first of `candidates` (queue order) that can serve and is past neither
+ * handoff threshold, or null when none qualifies (the caller then keeps plain
+ * queue order). Reads only.
+ *
+ * @param {any} accountManager
+ * @param {number[]} candidates
+ * @param {string|null} model
+ * @param {string|null} advisorModel
+ * @param {HandoffSettings} settings
+ * @param {number} [now]
+ * @returns {number|null}
+ */
+export function softDrainIndex(accountManager, candidates, model, advisorModel, settings, now = Date.now()) {
+  for (const i of candidates) {
+    const account = accountManager.accounts[i];
+    if (!account || seatVerdict(accountManager, account, model, advisorModel, now)) continue;
+    if (!pastHandoffThreshold(handoffWindows(accountManager, account, model), settings, now)) return i;
+  }
+  return null;
+}
+
+/**
  * @typedef {Object} HandoffDecision
  * @property {boolean} ask
  * @property {string} reason         why not, or 'near-limit' when asking
@@ -160,8 +219,8 @@ export function lastMessageIsTypedPrompt(body) {
  * Asked only when the pinned account's policy is `recommend` (force means the
  * owner chose silent continuation; a 429 would stop the workers), the account
  * can still serve (`verdict` null: once it is spent the post-limit offer
- * answers instead), a known window whose reset is still ahead is at or above
- * `utilization`, another account on the seat could take over (`sibling`), and
+ * answers instead), a known window whose reset is still ahead is past its
+ * threshold (pastHandoffThreshold), another account on the seat could take over (`sibling`), and
  * the record allows it.
  *
  * @param {Object} facts
@@ -185,10 +244,7 @@ export function decideHandoffBeforeSwitch({ settings, bodyBytes, pinKey, session
   if (pinned == null) return { ask: false, reason: 'not-pinned' };
   if (policy !== 'recommend') return { ask: false, reason: 'force' };
   if (verdict) return { ask: false, reason: 'cannot-serve' };
-  const near = (windows || [])
-    .filter(w => typeof w.utilization === 'number' && Number.isFinite(w.utilization)
-      && w.utilization >= settings.utilization && !(w.resetsAt != null && w.resetsAt <= now))
-    .sort((a, b) => /** @type {number} */ (b.utilization) - /** @type {number} */ (a.utilization))[0];
+  const near = pastHandoffThreshold(windows, settings, now);
   if (!near) return { ask: false, reason: 'not-near' };
   if (!sibling) return { ask: false, reason: 'no-sibling' };
   const blocked = asks.blocks(pinKey, sessionId, bodyBytes, settings.cooldownMs, now);
@@ -234,19 +290,20 @@ export function relativeTime(at, now) {
  * @param {string} info.account   the pinned account
  * @param {QuotaWindow} info.window
  * @param {string} info.sibling   the account that would take over
+ * @param {string|null} [info.fresh]  the account a new conversation would start on (softDrainIndex), when one qualifies
  * @param {number} info.cooldownMs
  * @param {number} [info.now]
  * @returns {{ status: number, headers: Record<string, string>, body: string }}
  */
-export function handoffAskAnswer({ account, window, sibling, cooldownMs, now = Date.now() }) {
+export function handoffAskAnswer({ account, window, sibling, fresh = null, cooldownMs, now = Date.now() }) {
   const name = `"${safeLine(account, 64)}"`;
-  const next = `"${safeLine(sibling, 64)}"`;
+  const next = `"${safeLine(fresh ?? sibling, 64)}"`;
   const pct = Math.round(/** @type {number} */ (window.utilization) * 100);
   const reset = window.resetsAt != null && window.resetsAt > now ? ` (resets in ${relativeTime(window.resetsAt, now)})` : '';
   const quiet = Math.max(1, Math.round(cooldownMs / 60_000));
   const message = `The account ${name}, pinned to this conversation, is at ${pct}% of its ${windowLabel(window.bucket)} quota${reset}. `
     + `It still serves this conversation with a warm prompt cache. Once it runs out, continuing this conversation means reprocessing it in full at full input-token cost on another assigned account (${next} appears available), using a cold prompt cache. `
-    + `Recommended now: run /ipm:handoff while ${name} can still summarize from its cache, then start a new conversation from that summary. `
+    + `Recommended now: run /ipm:handoff while ${name} can still summarize from its cache, then start a new conversation from that summary${fresh ? `; a new conversation will start on ${next}` : ''}. `
     + `Or send any prompt to keep going here on ${name}. `
     + `This request was not sent to Claude, and this conversation will not be asked again for ${quiet} minute${quiet === 1 ? '' : 's'}.`;
   return {

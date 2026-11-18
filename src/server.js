@@ -29,7 +29,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
-import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt } from './handoff-before-switch.js';
+import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt, softDrainIndex } from './handoff-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -3005,12 +3005,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         ? handoffAskFor(accountManager, config, { method: req.method, url: req.url, body, pinKey, sessionId, model, advisorModel, bound })
         : null;
       if (handoffAsk && !res.headersSent && !clientGone(res)) {
-        const { account, window: near, sibling, settings, asks, route } = handoffAsk;
+        const { account, window: near, sibling, fresh, settings, asks, route } = handoffAsk;
         // Recorded before the answer is written: the next prompt of this
         // conversation (the handoff itself) must find the record and go
         // through to the warm account.
         asks.record(handoffAsk.pinKey, handoffAsk.sessionId, body.length, settings.cooldownMs);
-        const answer = handoffAskAnswer({ account: account.name, window: near, sibling, cooldownMs: settings.cooldownMs });
+        const answer = handoffAskAnswer({ account: account.name, window: near, sibling, fresh, cooldownMs: settings.cooldownMs });
         res.writeHead(answer.status, answer.headers);
         res.end(answer.body);
         console.log(`[TeamClaude] Asked session ${handoffAsk.sessionId.slice(0, 8)} on seat "${safeLine(route, 64)}" to hand off before "${safeLine(account.name, 64)}" runs out: ${near.bucket} is at ${Math.round(/** @type {number} */ (near.utilization) * 100)}%, "${safeLine(sibling, 64)}" could take over, request body ${body.length} bytes. Answered 429 here; nothing was sent upstream (handoffBeforeSwitch)`);
@@ -3101,6 +3101,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // so a multi-account seat hops only inside itself.
         bound, boundExclude: bound ? new Set(/** @type {any} */ (accountManager).accounts.map((/** @type {any} */ a, /** @type {number} */ i) => i).filter((/** @type {number} */ i) => !bound.indices.includes(i))) : null,
         noAffinity, gate, seat: gateSeat,
+        // handoffBeforeSwitch (IPM fork): the thresholds fixed at admission for
+        // the soft drain in pickBoundAccount; null when off or not on a seat
+        // of two or more accounts.
+        handoffSettings: bound && bound.indices.length >= 2 ? resolveHandoffBeforeSwitch(/** @type {any} */ (config)?.handoffBeforeSwitch) : null,
         // Owner-root continuation (AI-1903): the admission snapshot of the
         // governing policy, the key hash it matched (never logged), the C9
         // offer-scope reference derived from it, the cg contract gate for the
@@ -3356,7 +3360,8 @@ function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey,
  *   - the pin is read the way pickBoundAccount reads it, and must be one of
  *     the seat's accounts that supports the model and the advisor model;
  *   - the sibling is the one the seat queue would offer after the limit
- *     (nextInSeatQueueIndex);
+ *     (nextInSeatQueueIndex), and `fresh` the account the soft drain would
+ *     start a new conversation on (softDrainIndex), null when none qualifies;
  *   - last, only when the body's last message is a typed user prompt, not a
  *     tool turn (lastMessageIsTypedPrompt).
  *
@@ -3365,7 +3370,7 @@ function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey,
  * @param {any} accountManager
  * @param {any} config
  * @param {{ method: string|undefined, url: string|undefined, body: Buffer, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null, bound: { route: string, indices: number[], policies: Map<number, 'force'|'recommend'> } }} request
- * @returns {{ account: Record<string, any>, window: import('./handoff-before-switch.js').QuotaWindow, sibling: string, settings: import('./handoff-before-switch.js').HandoffSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string, route: string }|null}
+ * @returns {{ account: Record<string, any>, window: import('./handoff-before-switch.js').QuotaWindow, sibling: string, fresh: string|null, settings: import('./handoff-before-switch.js').HandoffSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string, route: string }|null}
  */
 function handoffAskFor(accountManager, config, { method, url, body, pinKey, sessionId, model, advisorModel, bound }) {
   try {
@@ -3390,7 +3395,9 @@ function handoffAskFor(accountManager, config, { method, url, body, pinKey, sess
     });
     if (!decision.ask || !decision.window || !sibling) return null;
     if (!lastMessageIsTypedPrompt(body)) return null;
-    return { account, window: decision.window, sibling, settings, asks, pinKey, sessionId, route: bound.route };
+    const freshIdx = softDrainIndex(accountManager, bound.indices, model, advisorModel, settings);
+    const fresh = freshIdx == null || freshIdx === pinned ? null : accountManager.accounts[freshIdx]?.name ?? null;
+    return { account, window: decision.window, sibling, fresh, settings, asks, pinKey, sessionId, route: bound.route };
   } catch (/** @type {any} */ err) {
     reportFailure('[TeamClaude] handoffBeforeSwitch: the decision failed, forwarding the request:', err);
     return null;
@@ -4990,7 +4997,19 @@ function pickBoundAccount(accountManager, ctx) {
   const incompatiblePin = ctx.pinKey
     ? accountManager.sessionTracker.pinnedAccounts(ctx.pinKey).some((/** @type {number} */ idx) => left.includes(idx) && !compatible.includes(idx))
     : false;
-  const servable = candidates.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+  // Soft drain (handoffBeforeSwitch): with no compatible pin, start on the
+  // first servable account past neither handoff threshold, so a new
+  // conversation does not open on an account about to run out. None
+  // qualifying, or any error, keeps plain queue order.
+  let drained = null;
+  if (ctx.handoffSettings) {
+    try {
+      drained = softDrainIndex(accountManager, candidates, ctx.model, ctx.advisorModel, ctx.handoffSettings);
+    } catch (/** @type {any} */ err) {
+      reportFailure('[TeamClaude] handoffBeforeSwitch: the soft drain failed, keeping queue order:', err);
+    }
+  }
+  const servable = drained ?? candidates.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
   ctx.boundPinned = incompatiblePin;
   return accountManager.accounts[servable ?? candidates[0]] ?? null;
 }

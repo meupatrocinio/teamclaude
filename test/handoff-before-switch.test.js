@@ -7,8 +7,8 @@ import { CompactAsks } from '../src/compact-before-switch.js';
 import { keyHashOf, recordSeatRejection } from '../src/client-routes.js';
 import {
   resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffAskAnswer, handoffBeforeSwitchStatus,
-  handoffWindows, lastMessageIsTypedPrompt, relativeTime, windowLabel,
-  DEFAULT_UTILIZATION, DEFAULT_MIN_BODY_BYTES, DEFAULT_COOLDOWN_SECONDS,
+  handoffWindows, lastMessageIsTypedPrompt, relativeTime, windowLabel, pastHandoffThreshold,
+  DEFAULT_FIVE_HOUR_UTILIZATION, DEFAULT_WEEKLY_UTILIZATION, DEFAULT_MIN_BODY_BYTES, DEFAULT_COOLDOWN_SECONDS,
 } from '../src/handoff-before-switch.js';
 
 // handoffBeforeSwitch (IPM fork): a large seat-bound conversation whose pinned
@@ -18,12 +18,12 @@ import {
 
 const HOUR = 3600_000;
 const MINUTE = 60_000;
-const DEFAULTS = { utilization: DEFAULT_UTILIZATION, minBodyBytes: DEFAULT_MIN_BODY_BYTES, cooldownMs: DEFAULT_COOLDOWN_SECONDS * 1000 };
+const DEFAULTS = { fiveHourUtilization: DEFAULT_FIVE_HOUR_UTILIZATION, weeklyUtilization: DEFAULT_WEEKLY_UTILIZATION, minBodyBytes: DEFAULT_MIN_BODY_BYTES, cooldownMs: DEFAULT_COOLDOWN_SECONDS * 1000 };
 
 // ── the setting ──────────────────────────────────────────────────────────────
 
 test('the setting is on by default and only false turns it off', () => {
-  assert.deepEqual(DEFAULTS, { utilization: 0.9, minBodyBytes: 200_000, cooldownMs: 1_800_000 });
+  assert.deepEqual(DEFAULTS, { fiveHourUtilization: 0.75, weeklyUtilization: 0.9, minBodyBytes: 200_000, cooldownMs: 1_800_000 });
   for (const raw of [undefined, null, true, {}, 'yes', 1, []]) {
     assert.deepEqual(resolveHandoffBeforeSwitch(raw), DEFAULTS, `${JSON.stringify(raw)} is on with the defaults`);
   }
@@ -32,11 +32,12 @@ test('the setting is on by default and only false turns it off', () => {
 
 test('an object tunes each field, and a field that is not a usable number takes its default', () => {
   assert.deepEqual(
-    resolveHandoffBeforeSwitch({ utilization: 0.8, minBodyBytes: 1000, cooldownSeconds: 60 }),
-    { utilization: 0.8, minBodyBytes: 1000, cooldownMs: 60_000 },
+    resolveHandoffBeforeSwitch({ fiveHourUtilization: 0.6, weeklyUtilization: 0.8, minBodyBytes: 1000, cooldownSeconds: 60 }),
+    { fiveHourUtilization: 0.6, weeklyUtilization: 0.8, minBodyBytes: 1000, cooldownMs: 60_000 },
   );
-  for (const utilization of [0, 1, -0.1, 2, '0.8', NaN, null]) {
-    assert.equal(resolveHandoffBeforeSwitch({ utilization })?.utilization, DEFAULT_UTILIZATION, `utilization ${utilization}`);
+  for (const v of [0, 1, -0.1, 2, '0.8', NaN, null]) {
+    assert.equal(resolveHandoffBeforeSwitch({ fiveHourUtilization: v })?.fiveHourUtilization, DEFAULT_FIVE_HOUR_UTILIZATION, `fiveHourUtilization ${v}`);
+    assert.equal(resolveHandoffBeforeSwitch({ weeklyUtilization: v })?.weeklyUtilization, DEFAULT_WEEKLY_UTILIZATION, `weeklyUtilization ${v}`);
   }
   for (const v of [0, -1, '1000', Infinity, null]) {
     assert.equal(resolveHandoffBeforeSwitch({ minBodyBytes: v })?.minBodyBytes, DEFAULT_MIN_BODY_BYTES, `minBodyBytes ${v}`);
@@ -45,9 +46,9 @@ test('an object tunes each field, and a field that is not a usable number takes 
 });
 
 test('status reports the setting as resolved and the count asked', () => {
-  assert.deepEqual(handoffBeforeSwitchStatus(undefined, null), { enabled: true, utilization: 0.9, minBodyBytes: 200_000, cooldownSeconds: 1800, asked: 0 });
+  assert.deepEqual(handoffBeforeSwitchStatus(undefined, null), { enabled: true, fiveHourUtilization: 0.75, weeklyUtilization: 0.9, minBodyBytes: 200_000, cooldownSeconds: 1800, asked: 0 });
   assert.deepEqual(handoffBeforeSwitchStatus(false, { asked: 3 }), { enabled: false, asked: 3 });
-  assert.deepEqual(handoffBeforeSwitchStatus({ utilization: 0.85, cooldownSeconds: 60 }, { asked: 1 }), { enabled: true, utilization: 0.85, minBodyBytes: 200_000, cooldownSeconds: 60, asked: 1 });
+  assert.deepEqual(handoffBeforeSwitchStatus({ weeklyUtilization: 0.85, cooldownSeconds: 60 }, { asked: 1 }), { enabled: true, fiveHourUtilization: 0.75, weeklyUtilization: 0.85, minBodyBytes: 200_000, cooldownSeconds: 60, asked: 1 });
 });
 
 // ── the decision ─────────────────────────────────────────────────────────────
@@ -81,12 +82,29 @@ test('a large conversation near its 5-hour window, with a sibling, is asked', ()
   assert.equal(d.window?.bucket, 'unified5h');
 });
 
-test('the nearest window is the one named', () => {
+test('the window furthest past its own threshold is the one named', () => {
+  // 5h 0.80 is 0.05 past 0.75; weekly 0.97 is 0.07 past 0.9.
   const d = decideHandoffBeforeSwitch(facts({ windows: [
-    { bucket: 'unified5h', utilization: 0.91, resetsAt: null },
+    { bucket: 'unified5h', utilization: 0.80, resetsAt: null },
     { bucket: 'unified7d', utilization: 0.97, resetsAt: null },
   ] }));
   assert.equal(d.window?.bucket, 'unified7d');
+  // 5h 0.91 is 0.16 past; it wins over the higher weekly reading.
+  assert.equal(pastHandoffThreshold([
+    { bucket: 'unified5h', utilization: 0.91, resetsAt: null },
+    { bucket: 'unified7d', utilization: 0.97, resetsAt: null },
+  ], DEFAULTS, NOW)?.bucket, 'unified5h');
+});
+
+test('5-hour and weekly windows each meet their own threshold', () => {
+  const at = (/** @type {string} */ bucket, /** @type {number} */ utilization) => pastHandoffThreshold([{ bucket, utilization, resetsAt: null }], DEFAULTS, NOW);
+  assert.equal(at('unified5h', 0.74), null);
+  assert.equal(at('unified5h', 0.75)?.bucket, 'unified5h');
+  for (const bucket of ['unified7d', 'unified7dFable', 'scopedWeekly']) {
+    assert.equal(at(bucket, 0.85), null, `${bucket} 0.85 is not past the weekly threshold`);
+    assert.equal(at(bucket, 0.9)?.bucket, bucket);
+  }
+  assert.equal(pastHandoffThreshold([{ bucket: 'unified5h', utilization: 0.95, resetsAt: NOW - 1 }], DEFAULTS, NOW), null, 'a turned-over window is skipped');
 });
 
 test('each condition that fails forwards the request, with its reason', () => {
@@ -99,6 +117,7 @@ test('each condition that fails forwards the request, with its reason', () => {
     [{ policy: 'force' }, 'force'],
     [{ verdict: { kind: 'spent' } }, 'cannot-serve'],
     [{ windows: [{ bucket: 'unified5h', utilization: 0.5, resetsAt: null }] }, 'not-near'],
+    [{ windows: [{ bucket: 'unified7d', utilization: 0.85, resetsAt: null }] }, 'not-near'],
     [{ windows: [{ bucket: 'unified5h', utilization: null, resetsAt: null }] }, 'not-near'],
     [{ windows: [] }, 'not-near'],
     // A reading whose window already turned over says nothing about now.
@@ -209,13 +228,13 @@ const LARGE = 210_000;
 
 /**
  * A gateway with a three-account seat (amy) and a one-account seat (ben) in
- * front of a stub upstream. `five[name]` is the 5-hour utilization the stub
- * reports for that account on every answer, so a reading arrives the way a
- * real one does.
- * @param {{ five?: Record<string, number>, config?: Record<string, any>, policies?: any[] }} opts
+ * front of a stub upstream. `five[name]` and `week[name]` are the 5-hour and
+ * weekly utilizations the stub reports for that account on every answer, so a
+ * reading arrives the way a real one does.
+ * @param {{ five?: Record<string, number>, week?: Record<string, number>, config?: Record<string, any>, policies?: any[] }} opts
  * @param {(h: { send: (r?: Record<string, any>) => Promise<any>, seen: string[], am: any, config: Record<string, any>, logs: string[], ends: any[] }) => Promise<void>} fn
  */
-async function withGateway({ five = { qa: 0.93 }, config: extra = {}, policies } = {}, fn) {
+async function withGateway({ five = { qa: 0.93 }, week = {}, config: extra = {}, policies } = {}, fn) {
   /** @type {string[]} */
   const seen = [];
   const upstream = http.createServer(async (req, res) => {
@@ -228,6 +247,10 @@ async function withGateway({ five = { qa: 0.93 }, config: extra = {}, policies }
     if (five[who] != null) {
       headers['anthropic-ratelimit-unified-5h-utilization'] = String(five[who]);
       headers['anthropic-ratelimit-unified-5h-reset'] = sec(Date.now() + 2 * HOUR);
+    }
+    if (week[who] != null) {
+      headers['anthropic-ratelimit-unified-7d-utilization'] = String(week[who]);
+      headers['anthropic-ratelimit-unified-7d-reset'] = sec(Date.now() + 48 * HOUR);
     }
     res.writeHead(200, headers);
     res.end(okBody);
@@ -388,13 +411,13 @@ test('disabled, including by a reload of the live config: forwarded', async () =
     config.handoffBeforeSwitch = false;
     assert.equal((await send()).status, 200);
     assert.deepEqual(seen, ['qa', 'qa']);
-    config.handoffBeforeSwitch = { utilization: 0.92 };
+    config.handoffBeforeSwitch = { fiveHourUtilization: 0.92 };
     assert.equal((await send()).status, 429, 'turned back on and tuned by the next reload');
   });
 });
 
-test('a tuned utilization and body size apply', async () => {
-  await withGateway({ five: { qa: 0.85 }, config: { handoffBeforeSwitch: { utilization: 0.8, minBodyBytes: 5000 } } }, async ({ send, seen }) => {
+test('a tuned threshold and body size apply', async () => {
+  await withGateway({ five: { qa: 0.7 }, config: { handoffBeforeSwitch: { fiveHourUtilization: 0.65, minBodyBytes: 5000 } } }, async ({ send, seen }) => {
     assert.equal((await send({ pad: 6000 })).status, 200);
     assert.equal((await send({ pad: 6000 })).status, 429);
     assert.deepEqual(seen, ['qa']);
@@ -459,5 +482,84 @@ test('an explicit account pin is never asked', async () => {
     assert.equal((await send({ path: '/tc-acct/qa/v1/messages' })).status, 200);
     assert.deepEqual(seen, ['qa', 'qa']);
     assert.equal(am.handoffAsks.asked, 0);
+  });
+});
+
+// ── two thresholds and the soft drain ────────────────────────────────────────
+
+/** Put a reading on an account directly, as if upstream had reported it. @param {any} account @param {Record<string, number>} q */
+const reading = (account, q) => Object.assign(account.quota, q);
+
+test('a 5-hour reading of 0.80 is asked, and names the account a new conversation starts on', async () => {
+  await withGateway({ five: { qa: 0.8 } }, async ({ send, seen }) => {
+    assert.equal((await send()).status, 200);
+    const asked = await send();
+    assert.equal(asked.status, 429);
+    const msg = asked.json?.error?.message ?? '';
+    assert.match(msg, /is at 80% of its 5-hour quota/);
+    assert.match(msg, /a new conversation will start on "qb"/);
+    assert.deepEqual(seen, ['qa']);
+  });
+});
+
+test('a weekly reading of 0.85 is past neither threshold: not asked, and new conversations stay on qa', async () => {
+  await withGateway({ five: {}, week: { qa: 0.85 } }, async ({ send, seen, am }) => {
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200, 'not asked');
+    assert.equal((await send({ opening: 'another task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa', 'qa']);
+    assert.equal(am.handoffAsks.asked, 0);
+  });
+});
+
+test('soft drain: a new conversation starts on qb while the one pinned to qa stays there', async () => {
+  await withGateway({ five: { qa: 0.8 } }, async ({ send, seen }) => {
+    assert.equal((await send({ pad: 100 })).status, 200, 'pins the first conversation to qa, which reads 0.80');
+    assert.equal((await send({ opening: 'a new task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qb'], 'the new conversation was not drained to qb');
+    assert.equal((await send({ pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qb', 'qa'], 'the pinned conversation moved');
+  });
+});
+
+test('soft drain applies to workers too', async () => {
+  await withGateway({ five: { qa: 0.8 } }, async ({ send, seen }) => {
+    const worker = `w1_${'cd'.repeat(16)}`;
+    assert.equal((await send({ worker, pad: 100 })).status, 200);
+    assert.equal((await send({ worker, opening: 'a new task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qb']);
+  });
+});
+
+test('soft drain, every account past a threshold: queue order (qa), as today', async () => {
+  await withGateway({ five: {} }, async ({ send, seen, am }) => {
+    const reset = Date.now() + 2 * HOUR;
+    reading(am.accounts[0], { unified5h: 0.8, unified5hReset: reset });
+    reading(am.accounts[1], { unified7d: 0.95, unified7dReset: reset });
+    reading(am.accounts[2], { unified5h: 0.9, unified5hReset: reset });
+    assert.equal((await send({ opening: 'a new task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa']);
+  });
+});
+
+test('soft drain off: a new conversation starts on qa even when it is past', async () => {
+  await withGateway({ five: { qa: 0.8 }, config: { handoffBeforeSwitch: false } }, async ({ send, seen }) => {
+    assert.equal((await send({ pad: 100 })).status, 200);
+    assert.equal((await send({ opening: 'a new task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa']);
+  });
+});
+
+test('when no account qualifies for a new conversation, the ask keeps the "appears available" sibling wording', async () => {
+  await withGateway({}, async ({ send, am }) => {
+    assert.equal((await send()).status, 200);
+    const reset = Date.now() + 2 * HOUR;
+    reading(am.accounts[1], { unified7d: 0.95, unified7dReset: reset });
+    reading(am.accounts[2], { unified5h: 0.9, unified5hReset: reset });
+    const asked = await send();
+    assert.equal(asked.status, 429);
+    const msg = asked.json?.error?.message ?? '';
+    assert.match(msg, /\("qb" appears available\)/);
+    assert.doesNotMatch(msg, /a new conversation will start on/);
   });
 });

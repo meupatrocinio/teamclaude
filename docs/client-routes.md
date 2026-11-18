@@ -29,7 +29,9 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
   conversation pins to the first account it starts on. Each account has a per-request quota policy,
   selected by the caller (`recommend` by default, or `force`). The source account's policy governs
   each move. Fresh conversations take the first servable account immediately, so the seat's quota
-  drains one account at a time instead of spreading across all of them at once.
+  drains one account at a time instead of spreading across all of them at once. While
+  `handoffBeforeSwitch` is on, that is the first servable account past neither handoff threshold
+  (the [soft drain](#soft-drain)), so a new conversation does not open on an account about to run out.
 
   - `recommend`: while the pinned account still serves, a large conversation near one of its
     quota windows is told once to run `/ipm:handoff` (see [Handoff before the limit](#handoff-before-the-limit)).
@@ -179,8 +181,9 @@ completion bound to a seat with two or more accounts, with a client session, no 
 account pin, and no `x-teamclaude-worker-id` (a worker's 429 has no reader, so the ask would only
 stop it a turn before the limit would); its conversation is pinned to an account of the seat whose policy is `recommend`
 (never `force`: unattended workers chose silent continuation, and a 429 would stop them); that
-account can still serve; its known 5-hour or weekly utilization, for a window that has not already
-reset, is at least `utilization`; the body is at least `minBodyBytes`; another account on the seat
+account can still serve; for a window that has not already reset, its known 5-hour utilization is
+at least `fiveHourUtilization` or a known weekly one (shared, model family, or scoped) is at least
+`weeklyUtilization`; the body is at least `minBodyBytes`; another account on the seat
 can serve (the one the post-limit offer would name); and the conversation was not asked within
 `cooldownSeconds`, nor its client session within two minutes (the record `compactBeforeSwitch`
 uses, kept separately). Within the cooldown, a client session that was already asked is asked
@@ -189,17 +192,21 @@ last message must be a `user` prompt the person typed, with no `tool_result` blo
 mid-task or a subagent's tool turn is never asked.
 
 ```json
-"handoffBeforeSwitch": { "utilization": 0.9, "minBodyBytes": 200000, "cooldownSeconds": 1800 }
+"handoffBeforeSwitch": { "fiveHourUtilization": 0.75, "weeklyUtilization": 0.9, "minBodyBytes": 200000, "cooldownSeconds": 1800 }
 ```
 
-`false` turns it off; any field that is not a usable number takes its default (`utilization` above
-0 and below 1, the other two above 0). It is a fixed utilization rather than a margin under the
-switch threshold, because a seat ignores the switch threshold and runs until upstream rejects.
+`false` turns it off; any field that is not a usable number takes its default (the two
+utilizations above 0 and below 1, the other two above 0). They are fixed utilizations rather than a
+margin under the switch threshold, because a seat ignores the switch threshold and runs until
+upstream rejects. The 5-hour threshold is lower because under parallel sessions a 5-hour window can
+burn from its first serve to spent in minutes, which leaves too little room at 90% to run the
+handoff. When several windows are past, the one furthest past its own threshold is named.
 
 The answer is a 429 `rate_limit_error` with `x-should-retry: false` and no unified headers, the same
 shape as the post-limit offer, so Claude Code shows its text. It names the pinned account, the
-window and its percentage, the reset as a relative time when known, the sibling, and the choices:
-run `/ipm:handoff` now, or send any prompt to keep going on the pinned account. The ask is recorded
+window and its percentage, the reset as a relative time when known, the account a new conversation
+will start on (the soft drain's pick; when none qualifies, the sibling that appears available), and
+the choices: run `/ipm:handoff` now, or send any prompt to keep going on the pinned account. The ask is recorded
 before the answer is written, so the next prompt of that conversation, the handoff included, is
 forwarded to the warm account. Each ask writes one log line naming the session, seat, account,
 window and sibling, and shows in the activity log with status `429` and
@@ -207,6 +214,15 @@ window and sibling, and shows in the activity log with status `429` and
 setting as resolved and the count since start under `handoffBeforeSwitch`. Read per request, so
 `POST /teamclaude/reload` applies an edit to the next one. An error inside the decision forwards
 the request.
+
+### Soft drain
+
+With the same thresholds, while the setting is on, a seat of two or more accounts places a
+conversation that has no compatible pin on it on the first servable account in queue order that is
+past neither threshold. When none qualifies, it keeps plain queue order. It applies under any
+policy, workers included. A pinned conversation is never moved by it: it keeps its warm account
+until that account is spent, and the handoff's new conversation, like every new task, starts on the
+fresh account. The thresholds are read once when the request is admitted.
 
 ## Operator overrides
 
