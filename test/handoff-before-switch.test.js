@@ -8,7 +8,7 @@ import { keyHashOf, recordSeatRejection } from '../src/client-routes.js';
 import {
   resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffAskAnswer, handoffBeforeSwitchStatus,
   handoffWindows, lastMessageIsTypedPrompt, relativeTime, windowLabel, pastHandoffThreshold,
-  handoffHeadroom, rankByHeadroom, softDrainIndex,
+  handoffHeadroom, rankByHeadroom, softDrainIndex, preferSeatOrder,
   DEFAULT_FIVE_HOUR_UTILIZATION, DEFAULT_WEEKLY_UTILIZATION, DEFAULT_MIN_BODY_BYTES, DEFAULT_COOLDOWN_SECONDS,
 } from '../src/handoff-before-switch.js';
 
@@ -225,6 +225,24 @@ test('a seat ranks by free space, equal room keeps config order, and the setting
   assert.deepEqual(rankByHeadroom(am, [2, 1, 0], 'claude-opus-4-1', DEFAULTS), [2, 0, 1], 'ties keep the order given');
 });
 
+test('a seat priority queue goes first among the accounts with room, then among those past, the rest by free space', () => {
+  const am = new AccountManager(['qa', 'qb', 'qc', 'qd'].map(name => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR })), 0.98);
+  const reset = Date.now() + 2 * HOUR;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.6, unified7dReset: reset });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.95, unified7dReset: reset });
+  Object.assign(am.accounts[2].quota, { unified7d: 0.2, unified7dReset: reset });
+  Object.assign(am.accounts[3].quota, { unified5h: 0.8, unified5hReset: reset });
+  const model = 'claude-opus-4-1';
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, DEFAULTS), [2, 0, 1, 3], 'no queue: free space, qb and qd tie');
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, DEFAULTS, [0]), [0, 2, 1, 3]);
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, DEFAULTS, [3, 0]), [0, 2, 3, 1], 'qd is past: it leads the past part, not the whole seat');
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, DEFAULTS, [7, 3]), [2, 0, 3, 1], 'an index off the seat is skipped');
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, null, [2, 0]), [2, 0, 1, 3], 'setting off: listed, then config order');
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], model, null, []), [0, 1, 2, 3]);
+  assert.equal(softDrainIndex(am, [0, 1, 2, 3], model, null, DEFAULTS, [3, 0]), 0);
+  assert.deepEqual(preferSeatOrder([0, 1, 2], [2]), [2, 0, 1]);
+});
+
 test('the soft drain skips an account that cannot serve, and takes the most room even when every account is past', () => {
   const am = new AccountManager(['qa', 'qb', 'qc'].map(name => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR })), 0.98);
   const reset = Date.now() + 2 * HOUR;
@@ -311,7 +329,7 @@ async function withGateway({ five = { qa: 0.93 }, week = {}, config: extra = {},
   const origLog = console.log;
   console.log = (...args) => { logs.push(args.join(' ')); };
   // One turn of one conversation, named by its opening; `pad` sizes the body.
-  const send = async ({ key = KEYS.amy, session = 's-1', opening = 'first task', pad = LARGE, policy, worker, path = '/v1/messages', last = { role: 'user', content: 'go on' } } = {}) => {
+  const send = async ({ key = KEYS.amy, session = 's-1', opening = 'first task', pad = LARGE, policy, order, worker, path = '/v1/messages', last = { role: 'user', content: 'go on' } } = {}) => {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: 'POST',
       headers: {
@@ -319,6 +337,7 @@ async function withGateway({ five = { qa: 0.93 }, week = {}, config: extra = {},
         'x-api-key': key,
         'x-claude-code-session-id': session,
         ...(policy === undefined ? {} : { 'x-teamclaude-seat-policy': policy }),
+        ...(order === undefined ? {} : { 'x-teamclaude-seat-order': order }),
         ...(worker === undefined ? {} : { 'x-teamclaude-worker-id': worker }),
       },
       body: JSON.stringify({
@@ -596,6 +615,19 @@ test('when the pinned account still has the most room, the ask names the freest 
     const msg = asked.json?.error?.message ?? '';
     assert.match(msg, /\("qc" appears available\)/, 'qc (-0.09) has more room than qb (-0.20)');
     assert.doesNotMatch(msg, /a new conversation will start on/);
+  });
+});
+
+test('with a seat order, the ask names the listed sibling and the listed new-conversation account', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ order: 's1' })).status, 200, 'pins the conversation to qa, which reads 93%');
+    const asked = await send({ order: 's3,s1' });
+    assert.equal(asked.status, 429);
+    const msg = asked.json?.error?.message ?? '';
+    assert.match(msg, /"qc" appears available/, 'qc is listed; without the order the freest sibling in config order is qb');
+    assert.match(msg, /a new conversation will start on "qc"/);
+    assert.doesNotMatch(msg, /"qb"/);
+    assert.deepEqual(seen, ['qa']);
   });
 });
 

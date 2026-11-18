@@ -5,7 +5,7 @@ import { resolveAccountPin } from '../src/server.js';
 import {
   parseClientRoutes, routeForClient, resolveClientRoute, clientRoutePolicyActive,
   recordSeatRejection, liveSeatRejection, clearSeatRejection, seatVerdict, combineVerdicts,
-  seatAnswer, SEAT_REASONS, clientRoutesStatus, callerSeat, parseSeatPolicies,
+  seatAnswer, SEAT_REASONS, clientRoutesStatus, callerSeat, parseSeatPolicies, parseSeatOrder,
 } from '../src/client-routes.js';
 
 // Unit half of the client-route (fixed seat) feature, IPM fork AI-1552: the
@@ -67,6 +67,25 @@ test('seat policies fail closed as a whole on malformed or ambiguous input', () 
   assert.deepEqual(parseSeatPolicies('s1=force', { ...route, name: 's1+s1' }, [4, 8]), new Map(), 'duplicate route slug');
   assert.deepEqual(parseSeatPolicies('s1=force', route, [4, 4]), new Map(), 'duplicate account index');
   assert.deepEqual(parseSeatPolicies('s1=force', { ...route, name: 'seat-q' }, [4, 8]), new Map(), 'hand-written multi-account route name');
+});
+
+test('seat order: the listed accounts in the caller\'s order; a slug not on the route is skipped', () => {
+  const route = { name: 's1+s2+s3', clients: ['amy'], accounts: ['a@x', 'b@x', 'c@x'] };
+  assert.deepEqual(parseSeatOrder(undefined, route, [4, 8, 9]), []);
+  assert.deepEqual(parseSeatOrder('s3,s1', route, [4, 8, 9]), [9, 4]);
+  assert.deepEqual(parseSeatOrder(' s2 ', route, [4, 8, 9]), [8]);
+  assert.deepEqual(parseSeatOrder('gone,s1', route, [4, 8, 9]), [4], 'a stale slug is skipped');
+  assert.deepEqual(parseSeatOrder('seat-r,s2', route, [4, 8, 9]), [8], 'another route\'s seat is skipped');
+  assert.deepEqual(parseSeatOrder('seat-r', route, [4, 8, 9]), []);
+});
+
+test('seat order is ignored whole when malformed', () => {
+  const route = { name: 's1+s2', clients: ['amy'], accounts: ['a@x', 'b@x'] };
+  const invalid = ['', ' ', 's2,,s1', 's2,', ',s1', 'S2', 's2=force', 's2 s1', 's2,s2', `${'x'.repeat(41)}`,
+    Array.from({ length: 65 }, (_, i) => `x${i}`).join(',')];
+  for (const raw of invalid) assert.deepEqual(parseSeatOrder(raw, route, [4, 8]), [], raw);
+  assert.deepEqual(parseSeatOrder('s2', route, [4]), [], 'resolved account count mismatch');
+  assert.deepEqual(parseSeatOrder('s2', { ...route, name: 'seat-q' }, [4, 8]), [], 'hand-written multi-account route name');
 });
 
 test('policy is active with any route or with the switch on, and only then', () => {

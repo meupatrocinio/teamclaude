@@ -68,7 +68,7 @@ test('relayHttpForward strips the header and 400s a malformed one before the rel
       const req = http.request({
         host: '127.0.0.1', port, method: 'GET',
         path: `http://127.0.0.1:${upPort}/anything`,
-        headers: { 'x-api-key': 'ana-key', ...(worker === undefined ? {} : { 'x-teamclaude-worker-id': worker }) },
+        headers: { 'x-api-key': 'ana-key', 'x-teamclaude-seat-order': 's1,s2', ...(worker === undefined ? {} : { 'x-teamclaude-worker-id': worker }) },
       }, (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -81,6 +81,7 @@ test('relayHttpForward strips the header and 400s a malformed one before the rel
     assert.equal(ok.status, 200);
     assert.equal(witness.requests.length, 1);
     assert.equal(witness.requests[0]['x-teamclaude-worker-id'], undefined, 'the header reached the relay target');
+    assert.equal(witness.requests[0]['x-teamclaude-seat-order'], undefined, 'the seat order reached the relay target');
 
     const bad = await relay(BAD);
     assert.equal(bad.status, 400);
@@ -93,12 +94,13 @@ test('relayHttpForward strips the header and 400s a malformed one before the rel
 test('relayStream (client-credential path) strips the header', T, async () => {
   await withProxy(async ({ port, witness }) => {
     const res = await fetch(`http://127.0.0.1:${port}/api/oauth/profile`, {
-      headers: { 'x-api-key': 'ana-key', 'x-teamclaude-worker-id': W1, authorization: 'Bearer client-own' },
+      headers: { 'x-api-key': 'ana-key', 'x-teamclaude-worker-id': W1, 'x-teamclaude-seat-order': 's1,s2', authorization: 'Bearer client-own' },
     });
     assert.equal(res.status, 200);
     await res.text();
     assert.equal(witness.requests.length, 1);
     assert.equal(witness.requests[0]['x-teamclaude-worker-id'], undefined, 'the header reached upstream');
+    assert.equal(witness.requests[0]['x-teamclaude-seat-order'], undefined, 'the seat order reached upstream');
     assert.equal(witness.requests[0].authorization, 'Bearer client-own', 'the client credential still rides');
   });
 });

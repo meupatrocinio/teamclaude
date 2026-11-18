@@ -53,6 +53,34 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
   foreign slugs, or slug/account-length mismatches disable force for the whole request. The header
   is a preference, never routing authority, and is stripped before the request reaches Anthropic.
 
+### Seat priority queue
+
+A caller on a route of two or more accounts can say which of them it prefers, in order, with
+`x-teamclaude-seat-order: s3,s1` (`cg seat select` sends it). The slugs are the route's own, mapped
+to accounts by position as above. It reorders the queue, it does not pin:
+
+- While `handoffBeforeSwitch` is on, the accounts with room before their handoff thresholds come
+  first, then those past one. Inside each part, the listed accounts come in the caller's order, then
+  the unlisted ones by free space. A listed account past a threshold therefore yields to any account
+  with room, and is still preferred over the unlisted accounts past one.
+- With the setting off, the listed accounts come in the caller's order, then the rest in config order.
+
+The order is the one every destination uses: where a fresh conversation starts (the soft drain),
+where the recommend continuation and the force hop move a conversation off a spent account, and the
+account the post-limit offer and the handoff ask name. A pinned conversation is never moved by it,
+and a change of order applies only to conversations that start or move afterwards.
+
+A well-formed slug that is not on the caller's route (stale after a seat change, or another route's)
+is skipped, so the header can never reach an account the key is not bound to. A malformed header (an
+empty or invalid entry, a repeated slug, more than 64 entries or 4096 bytes) is ignored whole and the
+queue is plain free-space order. The header is stripped before the request reaches Anthropic. A
+request without it gets the order above with nothing listed.
+
+A build without this feature (1.1.30-ipm.3 and older) does not ignore the header: it does not know to
+strip it and forwards it to Anthropic, seat slugs included. Such a build advertises no
+`capabilities.seatOrder` on `/teamclaude/status`, so `cg` sends the header only to a proxy that
+reports `seatOrder: true`, and keeps a saved queue unsent until the gateway is updated.
+
 ### Owner-root continuation policies (AI-1903)
 
 `continuationPolicies` is the durable, owner-controlled form of the per-seat choice, rendered by
@@ -264,7 +292,7 @@ A client key cannot POST `/teamclaude/switch` (or `/teamclaude/session-pin`). Bo
 - `clientRoutes`: `[{ name, clients, accounts, resolved, problem? }]`, an empty list when none are
   configured;
 - `requireClientRoute`: `true` or `false`;
-- `capabilities`: `{ continuationPolicies: 1, workerIdentity: true }` — whether this build speaks owner-root continuation policies and accepts the opt-in `x-teamclaude-worker-id` worker identity (AI-1960);
+- `capabilities`: `{ continuationPolicies: 1, workerIdentity: true, seatOrder: true }` — whether this build speaks owner-root continuation policies, accepts the opt-in `x-teamclaude-worker-id` worker identity (AI-1960) and honours (and strips) the `x-teamclaude-seat-order` seat priority queue;
 - `caller.seat` for a client-key caller: `{ name, accounts, resolved, state, windows, resetsAt }`, or
   `null` when the key has no seat. The admin-key poll never carries it;
 - `caller.continuationPolicy` for a client-key caller: its own `{ source: "root" | "legacy", mode,
