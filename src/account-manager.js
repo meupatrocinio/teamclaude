@@ -946,6 +946,11 @@ export class AccountManager {
     // there is one record per fleet. Empty and unread unless the setting is on.
     /** @type {CompactAsks} */
     this.compactAsks = new CompactAsks();
+    // Which seat-bound conversations were already told to hand off before
+    // their pinned account runs out (`handoffBeforeSwitch`, IPM fork). Its own
+    // record, shared by every listener for the same reason as the one above.
+    /** @type {CompactAsks} */
+    this.handoffAsks = new CompactAsks();
     // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.

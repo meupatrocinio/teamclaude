@@ -601,10 +601,12 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null,
       const rej = verdict?.kind === 'spent' ? verdict.rejection : null;
       const when = rej ? new Date(rej.resetsAt).toISOString() : null;
       // A conversation pinned inside a multi-account seat is told the queue:
-      // the next account would serve, at one full-price cold-cache turn, and
-      // a handoff is the cheaper way to get there.
+      // the next account would serve, at one full-price cold-cache turn. No
+      // handoff is recommended here: running one is a prompt in this
+      // conversation, so it would confirm the continuation it meant to avoid.
+      // handoffBeforeSwitch recommends it while the pinned account still serves.
       const continuationMessage = queue && queue.next
-        ? `You can keep working by moving to another assigned account; "${safeLine(queue.next, 64)}" appears available. The account "${safeLine(queue.pinned, 64)}", pinned to this conversation, cannot serve this request because its quota is exhausted${when ? ` until ${when}` : ''}. Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account that appears available, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that appears available at that time, using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required. ${KIMI_HINT}${ownerRoot ? ` ${CG_SEAT_POLICY_ROOT_PARAGRAPH}` : ''}`
+        ? `You can keep working by moving to another assigned account; "${safeLine(queue.next, 64)}" appears available. The account "${safeLine(queue.pinned, 64)}", pinned to this conversation, cannot serve this request because its quota is exhausted${when ? ` until ${when}` : ''}. If you retry or continue THIS conversation, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that appears available at that time, using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required. Otherwise, start a new conversation, which uses the next assigned account that appears available, currently "${safeLine(queue.next, 64)}", or wait for "${safeLine(queue.pinned, 64)}" to reset${when ? ` at ${when}` : ''}. ${KIMI_HINT}${ownerRoot ? ` ${CG_SEAT_POLICY_ROOT_PARAGRAPH}` : ''}`
         : null;
       const queueHint = queue && !queue.next
         ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`

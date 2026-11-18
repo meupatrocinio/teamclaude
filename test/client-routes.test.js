@@ -216,8 +216,9 @@ test('answers: status codes and the headers Claude Code keys on', () => {
   assert.equal(offered.headers['x-should-retry'], 'false');
   assert.equal(offered.headers['anthropic-ratelimit-unified-5h-reset'], undefined, 'the offer must not trigger the generic plan-limit banner');
   assert.ok(offeredMessage.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until 2030-03-17T17:46:40.000Z.'), offeredMessage);
-  assert.match(offeredMessage, /\/ipm:handoff/);
+  assert.doesNotMatch(offeredMessage, /\/ipm:handoff/, 'a handoff after the limit is itself the confirming prompt');
   assert.match(offeredMessage, /start a new conversation/);
+  assert.match(offeredMessage, /wait for "qa" to reset at 2030-03-17T17:46:40\.000Z/);
   assert.match(offeredMessage, /next assigned account that appears available, currently "qb"/);
   assert.match(offeredMessage, /on the next assigned account that appears available at that time/);
   assert.match(offeredMessage, /reprocess the full conversation at full input-token cost/);

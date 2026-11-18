@@ -14,6 +14,7 @@ import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountP
 import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { compactBeforeSwitchStatus } from './compact-before-switch.js';
+import { handoffBeforeSwitchStatus } from './handoff-before-switch.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -759,6 +760,9 @@ async function serverCommand() {
     // Resolved off this object per request (server.js compactAskFor), so the
     // assignment is the whole application, and removing the key turns it off.
     config.compactBeforeSwitch = diskConfig.compactBeforeSwitch;
+    // The same for the fork's handoffBeforeSwitch (server.js handoffAskFor),
+    // which is on unless `false`: removing the key turns it back on.
+    config.handoffBeforeSwitch = diskConfig.handoffBeforeSwitch;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.
@@ -1023,6 +1027,8 @@ async function serverCommand() {
     // `compactBeforeSwitch` as the request path resolves it, read off the same
     // live object, with the count of requests it has answered since start.
     compactBeforeSwitch: compactBeforeSwitchStatus(config.compactBeforeSwitch, accountManager.compactAsks),
+    // `handoffBeforeSwitch` (IPM fork) the same way, from its own record.
+    handoffBeforeSwitch: handoffBeforeSwitchStatus(config.handoffBeforeSwitch, accountManager.handoffAsks),
     // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.

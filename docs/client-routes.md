@@ -29,11 +29,15 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
   conversation pins to the first account it starts on. Each account has a per-request quota policy,
   selected by the caller (`recommend` by default, or `force`). The source account's policy governs
   each move. Fresh conversations take the first servable account immediately, so the seat's quota
-  drains one account at a time instead of spreading across all of them at once.
+  drains one account at a time instead of spreading across all of them at once. While
+  `handoffBeforeSwitch` is on, that is the first servable account past neither handoff threshold
+  (the [soft drain](#soft-drain)), so a new conversation does not open on an account about to run out.
 
-  - `recommend`: the first quota failure recommends `/ipm:handoff` and a fresh session, and warns
-    that continuing the same conversation will reprocess its full context with a cold prompt cache.
-    A later prompt in that same conversation confirms the switch once and re-pins there.
+  - `recommend`: while the pinned account still serves, a large conversation near one of its
+    quota windows is told once to run `/ipm:handoff` (see [Handoff before the limit](#handoff-before-the-limit)).
+    The first quota failure warns that continuing the same conversation will reprocess its full
+    context with a cold prompt cache, and offers a new conversation or waiting for the reset. A
+    later prompt in that same conversation confirms the switch once and re-pins there.
   - `force`: the first real quota failure immediately retries the identical request body on the
     first assigned account that can serve, preserving the conversation, and re-pins there. Every
     force hop is independently authorized by the account that just failed.
@@ -136,7 +140,8 @@ When the seat cannot serve, the answer always comes from the seat itself:
 | Seat state | Answer |
 |---|---|
 | Spent: upstream sent a 429 rejecting a quota window, and that window's reset is still ahead | 429 with upstream's own `anthropic-ratelimit-unified-*` headers and `x-should-retry: false`. The 429 that reports the spend gets this answer at once. Later requests get it with nothing sent upstream. A `7d_oi` rejection covers Fable requests only. |
-| Spent pinned account in a multi-account route, with a servable sibling | `recommend`: the first response is an actionable 429 handoff offer with `x-should-retry: false` and no unified headers, so Claude Code shows the handoff and cold-cache choices instead of its generic plan-limit banner. Its message names the currently servable sibling first, then gives the reset blocking the pinned account for this request, so the reset does not read as a key-wide outage; the destination is selected again when the next request arrives. The next prompt confirms and switches once. `force`: the same request retries immediately on the sibling with its body unchanged. |
+| Spent pinned account in a multi-account route, with a servable sibling | `recommend`: the first response is an actionable 429 offer with `x-should-retry: false` and no unified headers, so Claude Code shows the choices (continue cold, start a new conversation, or wait for the reset) instead of its generic plan-limit banner. It does not recommend `/ipm:handoff`: after the limit, running one is itself the prompt that confirms the cold continuation. Its message names the currently servable sibling first, then gives the reset blocking the pinned account for this request, so the reset does not read as a key-wide outage; the destination is selected again when the next request arrives. The next prompt confirms and switches once. `force`: the same request retries immediately on the sibling with its body unchanged. |
+| Pinned account in a multi-account route near a quota window, still serving, `recommend`, with a servable sibling | Once per conversation per cooldown, for a large request: an actionable 429 recommending `/ipm:handoff` now (`handoffBeforeSwitch`, below). Nothing is sent upstream; the next prompt is served by the pinned account. |
 | Throttled (rate-limit hold) | 429 with `retry-after`. It stays retryable. |
 | Operator budget cap (`maxUsage`, `maxSpend`) | 429 with `x-should-retry: false`. No unified headers are made up. |
 | Disabled, in error, credential or routing failure, route unresolved or ambiguous | 503 with `x-should-retry: false` |
@@ -163,6 +168,61 @@ Force applies only to genuine quota rejection. Throttling, credential/entitlemen
 third-party 400s, stream failures, transport errors, operator caps, and token/routing failures never
 move a pinned conversation to a sibling. Fresh, unpinned conversations keep their ordinary queue
 advance behavior.
+
+## Handoff before the limit
+
+`handoffBeforeSwitch` (on by default) recommends `/ipm:handoff` while it can still help. After the
+pinned account is spent, running the handoff is a prompt in that same conversation, so it confirms
+the cold-cache continuation it was meant to avoid. Before the limit, the pinned account summarizes
+the conversation from its warm cache, and the new conversation starts small.
+
+A request is answered with the ask only when all of these hold: it is a `POST /v1/messages`
+completion bound to a seat with two or more accounts, with a client session, no explicit
+account pin, and no `x-teamclaude-worker-id` (a worker's 429 has no reader, so the ask would only
+stop it a turn before the limit would); its conversation is pinned to an account of the seat whose policy is `recommend`
+(never `force`: unattended workers chose silent continuation, and a 429 would stop them); that
+account can still serve; for a window that has not already reset, its known 5-hour utilization is
+at least `fiveHourUtilization` or a known weekly one (shared, model family, or scoped) is at least
+`weeklyUtilization`; the body is at least `minBodyBytes`; another account on the seat
+can serve (the one the post-limit offer would name); and the conversation was not asked within
+`cooldownSeconds`, nor its client session within two minutes (the record `compactBeforeSwitch`
+uses, kept separately). Within the cooldown, a client session that was already asked is asked
+again only by a body at least as large as the one it was asked on (`session-smaller`). The body's
+last message must be a `user` prompt the person typed, with no `tool_result` block, so a turn
+mid-task or a subagent's tool turn is never asked.
+
+```json
+"handoffBeforeSwitch": { "fiveHourUtilization": 0.75, "weeklyUtilization": 0.9, "minBodyBytes": 200000, "cooldownSeconds": 1800 }
+```
+
+`false` turns it off; any field that is not a usable number takes its default (the two
+utilizations above 0 and below 1, the other two above 0). They are fixed utilizations rather than a
+margin under the switch threshold, because a seat ignores the switch threshold and runs until
+upstream rejects. The 5-hour threshold is lower because under parallel sessions a 5-hour window can
+burn from its first serve to spent in minutes, which leaves too little room at 90% to run the
+handoff. When several windows are past, the one furthest past its own threshold is named.
+
+The answer is a 429 `rate_limit_error` with `x-should-retry: false` and no unified headers, the same
+shape as the post-limit offer, so Claude Code shows its text. It names the pinned account, the
+window and its percentage, the reset as a relative time when known, the account a new conversation
+will start on (the soft drain's pick; when none qualifies, the sibling that appears available), and
+the choices: run `/ipm:handoff` now, or send any prompt to keep going on the pinned account. The ask is recorded
+before the answer is written, so the next prompt of that conversation, the handoff included, is
+forwarded to the warm account. Each ask writes one log line naming the session, seat, account,
+window and sibling, and shows in the activity log with status `429` and
+`(handoff before switch: <account>)` in place of the account. `GET /teamclaude/status` reports the
+setting as resolved and the count since start under `handoffBeforeSwitch`. Read per request, so
+`POST /teamclaude/reload` applies an edit to the next one. An error inside the decision forwards
+the request.
+
+### Soft drain
+
+With the same thresholds, while the setting is on, a seat of two or more accounts places a
+conversation that has no compatible pin on it on the first servable account in queue order that is
+past neither threshold. When none qualifies, it keeps plain queue order. It applies under any
+policy, workers included. A pinned conversation is never moved by it: it keeps its warm account
+until that account is spent, and the handoff's new conversation, like every new task, starts on the
+fresh account. The thresholds are read once when the request is admitted.
 
 ## Operator overrides
 

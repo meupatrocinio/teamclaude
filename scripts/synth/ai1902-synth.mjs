@@ -407,8 +407,8 @@ async function scenarioRecommend(expectRoot) {
   if (expectRoot) {
     check('2 recommend: continuation 429 offer', t1.servedBy === 'r1' && t2.status === 429 && t2.upstreamAttempts.join() === 'r1:429'
       && t2.headers['x-should-retry'] === 'false' && !t2.headers['anthropic-ratelimit-unified-status']
-      && /next prompt confirms/.test(msg) && /\/ipm:handoff/.test(msg) && /cold prompt cache/.test(msg) && names,
-    `t2 ${brief(t2)} x-should-retry=false, no unified headers; body names \`cg seat-policy force\` + \`cg seat-policy recommend\`, /ipm:handoff, cold-cache warning; legacy *=force header did not hop`);
+      && /next prompt confirms/.test(msg) && !/\/ipm:handoff/.test(msg) && /cold prompt cache/.test(msg) && names,
+    `t2 ${brief(t2)} x-should-retry=false, no unified headers; body names \`cg seat-policy force\` + \`cg seat-policy recommend\`, no post-limit /ipm:handoff, cold-cache warning; legacy *=force header did not hop`);
     check('2 recommend: next prompt accepts and continues', t3.status === 200 && t3.servedBy === 'r2' && t3.upstreamAttempts.join() === 'r2:200'
       && /cold-cache=true/.test(t3.headers['x-teamclaude-seat-failover'] || ''),
     `t3 (same conversation, next prompt) ${brief(t3)}`);
