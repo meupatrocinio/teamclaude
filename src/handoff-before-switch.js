@@ -23,9 +23,10 @@
 // serve to spent in minutes, and one for every weekly window. The record of
 // who was asked is a CompactAsks of its own (AccountManager.handoffAsks).
 //
-// The same thresholds drive the soft drain (softDrainIndex): a conversation
-// with no pin on the seat starts on the first servable account past neither,
-// so the handoff's new conversation, and every new task, lands on a fresh
+// The same thresholds measure free space (handoffHeadroom, rankByHeadroom): a
+// conversation with no pin on the seat starts on the servable account with the
+// most room (softDrainIndex), and a continuation moves in that order too, so
+// the handoff's new conversation, and every new task, lands on the freest
 // account while pinned conversations keep their warm one to the limit.
 //
 // This module holds the parts that need no server: the setting, the readings,
@@ -178,10 +179,56 @@ export function pastHandoffThreshold(windows, settings, now) {
 }
 
 /**
+ * An account's room before its first handoff threshold: the tightest of its
+ * windows, the 5-hour one against `fiveHourUtilization` and every weekly one
+ * against `weeklyUtilization`. A window with no reading, or one already reset,
+ * counts as unused. Negative once a window is past its threshold. Rounded so
+ * that equal room compares equal and keeps queue order.
+ *
+ * @param {QuotaWindow[]|null|undefined} windows
+ * @param {HandoffSettings} settings
+ * @param {number} now
+ * @returns {number}
+ */
+export function handoffHeadroom(windows, settings, now) {
+  let room = Infinity;
+  for (const w of windows || []) {
+    const limit = w.bucket === 'unified5h' ? settings.fiveHourUtilization : settings.weeklyUtilization;
+    const u = w.utilization;
+    const used = typeof u === 'number' && Number.isFinite(u) && !(w.resetsAt != null && w.resetsAt <= now) ? u : 0;
+    room = Math.min(room, limit - used);
+  }
+  return room === Infinity ? room : Math.round(room * 1e6) / 1e6;
+}
+
+/**
+ * A seat's accounts ordered by free space: most handoff headroom first
+ * (handoffHeadroom), equal room in the order given (config order). With the
+ * setting off (`settings` null) the order given, unchanged. Reads only; does
+ * not filter out accounts that cannot serve.
+ *
+ * @param {any} accountManager
+ * @param {number[]} indices
+ * @param {string|null} model
+ * @param {HandoffSettings|null} settings
+ * @param {number} [now]
+ * @returns {number[]}
+ */
+export function rankByHeadroom(accountManager, indices, model, settings, now = Date.now()) {
+  if (!settings) return indices;
+  const ranked = indices.map((i, pos) => {
+    const account = accountManager.accounts[i];
+    return { i, pos, room: account ? handoffHeadroom(handoffWindows(accountManager, account, model), settings, now) : -Infinity };
+  });
+  ranked.sort((a, b) => (b.room > a.room ? 1 : b.room < a.room ? -1 : a.pos - b.pos));
+  return ranked.map(e => e.i);
+}
+
+/**
  * The soft drain: the account a conversation with no pin on a seat starts on,
- * the first of `candidates` (queue order) that can serve and is past neither
- * handoff threshold, or null when none qualifies (the caller then keeps plain
- * queue order). Reads only.
+ * the servable account of `candidates` with the most free space
+ * (rankByHeadroom), even when every one is past a threshold, or null when
+ * none can serve. Reads only.
  *
  * @param {any} accountManager
  * @param {number[]} candidates
@@ -192,10 +239,9 @@ export function pastHandoffThreshold(windows, settings, now) {
  * @returns {number|null}
  */
 export function softDrainIndex(accountManager, candidates, model, advisorModel, settings, now = Date.now()) {
-  for (const i of candidates) {
+  for (const i of rankByHeadroom(accountManager, candidates, model, settings, now)) {
     const account = accountManager.accounts[i];
-    if (!account || seatVerdict(accountManager, account, model, advisorModel, now)) continue;
-    if (!pastHandoffThreshold(handoffWindows(accountManager, account, model), settings, now)) return i;
+    if (account && !seatVerdict(accountManager, account, model, advisorModel, now)) return i;
   }
   return null;
 }
@@ -290,7 +336,7 @@ export function relativeTime(at, now) {
  * @param {string} info.account   the pinned account
  * @param {QuotaWindow} info.window
  * @param {string} info.sibling   the account that would take over
- * @param {string|null} [info.fresh]  the account a new conversation would start on (softDrainIndex), when one qualifies
+ * @param {string|null} [info.fresh]  the account a new conversation would start on (softDrainIndex), null when that is the pinned account
  * @param {number} info.cooldownMs
  * @param {number} [info.now]
  * @returns {{ status: number, headers: Record<string, string>, body: string }}

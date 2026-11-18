@@ -29,7 +29,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
-import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt, softDrainIndex } from './handoff-before-switch.js';
+import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt, softDrainIndex, rankByHeadroom } from './handoff-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -3102,8 +3102,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         bound, boundExclude: bound ? new Set(/** @type {any} */ (accountManager).accounts.map((/** @type {any} */ a, /** @type {number} */ i) => i).filter((/** @type {number} */ i) => !bound.indices.includes(i))) : null,
         noAffinity, gate, seat: gateSeat,
         // handoffBeforeSwitch (IPM fork): the thresholds fixed at admission for
-        // the soft drain in pickBoundAccount; null when off or not on a seat
-        // of two or more accounts.
+        // the seat's free-space order (seatOrder, the soft drain); null when
+        // off or not on a seat of two or more accounts.
         handoffSettings: bound && bound.indices.length >= 2 ? resolveHandoffBeforeSwitch(/** @type {any} */ (config)?.handoffBeforeSwitch) : null,
         // Owner-root continuation (AI-1903): the admission snapshot of the
         // governing policy, the key hash it matched (never logged), the C9
@@ -3359,9 +3359,10 @@ function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey,
  *   - only a completion (`POST /v1/messages`);
  *   - the pin is read the way pickBoundAccount reads it, and must be one of
  *     the seat's accounts that supports the model and the advisor model;
- *   - the sibling is the one the seat queue would offer after the limit
- *     (nextInSeatQueueIndex), and `fresh` the account the soft drain would
- *     start a new conversation on (softDrainIndex), null when none qualifies;
+ *   - the sibling is the one the seat would offer after the limit, the
+ *     servable account with the most free space (rankByHeadroom), and `fresh`
+ *     the account the soft drain would start a new conversation on
+ *     (softDrainIndex), null when that is the pinned one;
  *   - last, only when the body's last message is a typed user prompt, not a
  *     tool turn (lastMessageIsTypedPrompt).
  *
@@ -3385,7 +3386,7 @@ function handoffAskFor(accountManager, config, { method, url, body, pinKey, sess
     const pinned = pinIdx != null && bound.indices.includes(pinIdx) ? pinIdx : null;
     const account = pinned == null ? null : accountManager.accounts[pinned];
     if (!account || !accountSupportsModel(account, model) || !accountSupportsModel(account, advisorModel)) return null;
-    const next = nextInSeatQueueIndex(accountManager, bound.indices, pinned, model, advisorModel);
+    const next = nextInSeatQueueIndex(accountManager, rankByHeadroom(accountManager, bound.indices, model, settings), pinned, model, advisorModel);
     const sibling = next == null ? null : accountManager.accounts[next]?.name ?? null;
     const decision = decideHandoffBeforeSwitch({
       settings, bodyBytes, pinKey, sessionId, asks, pinned, sibling,
@@ -4774,7 +4775,7 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
   const detail = verdict.kind === 'unavailable' ? verdict.reason : null;
   const queue = accountManager && accountIndex != null && seatPolicyFor(ctx, accountIndex) === 'recommend'
     && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
-    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model, ctx.advisorModel) }
+    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, seatOrder(accountManager, ctx, ctx.bound.indices), accountIndex, ctx.model, ctx.advisorModel) }
     : null;
   // The C7 owner-root paragraph rides the actionable multi-seat answer only,
   // and only for a caller whose cg advertised the root-v1 contract (E7).
@@ -4845,7 +4846,7 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
     return false;
   }
   const excluded = new Set([...ctx.tried, ...(ctx.rolledOff ?? [])]);
-  const next = nextInSeatQueueIndex(accountManager, ctx.bound.indices, account.index, ctx.model, ctx.advisorModel, excluded);
+  const next = nextInSeatQueueIndex(accountManager, seatOrder(accountManager, ctx, ctx.bound.indices), account.index, ctx.model, ctx.advisorModel, excluded);
   if (next == null) return false;
   ctx.continuationHops = (ctx.continuationHops ?? 0) + 1;
   ctx.tried.add(account.index);
@@ -4920,18 +4921,39 @@ function respondContinuationStopped(res, ctx, shownAccount) {
 }
 
 /**
+ * A seat's accounts in the order a conversation moves onto them (IPM fork):
+ * most free space first (rankByHeadroom) while handoffBeforeSwitch is on, so
+ * the account a message names is the one the conversation goes to; config
+ * order when it is off or the ranking fails.
+ * @param {any} accountManager
+ * @param {Record<string, any>} ctx
+ * @param {number[]} indices
+ * @returns {number[]}
+ */
+function seatOrder(accountManager, ctx, indices) {
+  if (!ctx.handoffSettings) return indices;
+  try {
+    return rankByHeadroom(accountManager, indices, ctx.model, ctx.handoffSettings);
+  } catch (/** @type {any} */ err) {
+    reportFailure('[TeamClaude] handoffBeforeSwitch: ranking the seat by free space failed, keeping queue order:', err);
+    return indices;
+  }
+}
+
+/**
  * The account a request bound to a multi-account seat goes to next (IPM fork).
- * The seat's accounts are a drain queue in config order. A conversation pinned
+ * The seat's accounts are a queue (seatOrder). A conversation pinned
  * to one of them stays on it (ctx.boundPinned) while that account supports the
  * main and advisor models: its verdict — spent, throttled, unavailable — is the
  * request's own answer, never a silent move onto a sibling, which would
  * re-process the whole conversation there with a cold cache. An incompatible
  * pin is ignored so a model change can select another assigned adapter. A
  * conversation with no compatible pin in the seat — a fresh one, e.g. after a
- * handoff — takes the first servable account in queue order, so the seat's
- * quota drains one account at a time instead of spreading across all of them
- * at once. Null when the seat has nothing left, which the no-account branch
- * answers from the seat's state.
+ * handoff — takes the servable account with the most free space while
+ * handoffBeforeSwitch is on (softDrainIndex), else the first servable account
+ * in queue order. A confirmed continuation moves in the same order
+ * (seatOrder). Null when the seat has nothing left, which the no-account
+ * branch answers from the seat's state.
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
  */
@@ -4959,7 +4981,7 @@ function pickBoundAccount(accountManager, ctx) {
       ctx.seatContinuationChecked = true;
       const verdict = seatVerdict(accountManager, pinned, ctx.model, ctx.advisorModel);
       if (verdict?.kind === 'spent') {
-        const next = candidates.find((/** @type {number} */ i) => i !== pinIdx
+        const next = seatOrder(accountManager, ctx, candidates).find((/** @type {number} */ i) => i !== pinIdx
           && !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
         if (next != null) {
           const offer = accountManager.sessionTracker.takeSeatContinuation(ctx.pinKey, {
@@ -4998,9 +5020,8 @@ function pickBoundAccount(accountManager, ctx) {
     ? accountManager.sessionTracker.pinnedAccounts(ctx.pinKey).some((/** @type {number} */ idx) => left.includes(idx) && !compatible.includes(idx))
     : false;
   // Soft drain (handoffBeforeSwitch): with no compatible pin, start on the
-  // first servable account past neither handoff threshold, so a new
-  // conversation does not open on an account about to run out. None
-  // qualifying, or any error, keeps plain queue order.
+  // servable account with the most free space, so a new conversation does not
+  // open on an account about to run out. An error keeps plain queue order.
   let drained = null;
   if (ctx.handoffSettings) {
     try {
@@ -5523,7 +5544,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // pinned account's verdict as the answer (boundPinned): re-selecting
       // onto a sibling account of the seat would move the whole conversation
       // to a cold cache with no warning. Only an unpinned pick — a fresh
-      // conversation, which the queue order then advances — re-selects.
+      // conversation, which the seat order then advances — re-selects.
       if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
         ctx.tried.add(account.index);
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);

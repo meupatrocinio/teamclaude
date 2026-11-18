@@ -8,6 +8,7 @@ import { keyHashOf, recordSeatRejection } from '../src/client-routes.js';
 import {
   resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffAskAnswer, handoffBeforeSwitchStatus,
   handoffWindows, lastMessageIsTypedPrompt, relativeTime, windowLabel, pastHandoffThreshold,
+  handoffHeadroom, rankByHeadroom, softDrainIndex,
   DEFAULT_FIVE_HOUR_UTILIZATION, DEFAULT_WEEKLY_UTILIZATION, DEFAULT_MIN_BODY_BYTES, DEFAULT_COOLDOWN_SECONDS,
 } from '../src/handoff-before-switch.js';
 
@@ -199,6 +200,40 @@ test('each weekly bucket is its own window: a shared weekly above the Fable buck
   assert.deepEqual(d.window, { bucket: 'unified7d', utilization: 0.96, resetsAt: NOW + 30 * HOUR });
   const msg = JSON.parse(handoffAskAnswer({ account: 'qa', window: /** @type {any} */ (d.window), sibling: 'qb', cooldownMs: 1_800_000, now: NOW }).body).error.message;
   assert.match(msg, /is at 96% of its weekly quota \(resets in 1d 6h\)/);
+});
+
+test('free space is the tightest window against its own threshold; no reading, or a reset window, counts as unused', () => {
+  const w = (bucket, utilization, resetsAt = NOW + HOUR) => ({ bucket, utilization, resetsAt });
+  assert.equal(handoffHeadroom([w('unified5h', null), w('unified7d', null)], DEFAULTS, NOW), 0.75);
+  assert.equal(handoffHeadroom([w('unified5h', 0.5), w('unified7d', 0.1)], DEFAULTS, NOW), 0.25);
+  assert.equal(handoffHeadroom([w('unified5h', 0.1), w('unified7d', 0.6)], DEFAULTS, NOW), 0.3);
+  assert.equal(handoffHeadroom([w('unified5h', 0.1), w('unified7d', 0.2), w('unified7dFable', 0.95)], DEFAULTS, NOW), -0.05);
+  assert.equal(handoffHeadroom([w('unified5h', 0.99, NOW - 1), w('unified7d', 0.2)], DEFAULTS, NOW), 0.7, 'a reset window still counted');
+  assert.equal(handoffHeadroom([w('unified5h', 0.4), w('unified7d', 0.55)], DEFAULTS, NOW), handoffHeadroom([w('unified5h', 0.1), w('unified7d', 0.55)], DEFAULTS, NOW), 'equal room must compare equal');
+});
+
+test('a seat ranks by free space, equal room keeps config order, and the setting off keeps config order', () => {
+  const am = new AccountManager(['qa', 'qb', 'qc', 'qd'].map(name => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR })), 0.98);
+  const reset = Date.now() + 2 * HOUR;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.6, unified7dReset: reset });
+  Object.assign(am.accounts[1].quota, { unified5h: 0.7, unified5hReset: reset });
+  Object.assign(am.accounts[2].quota, { unified7d: 0.2, unified7dReset: reset });
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], 'claude-opus-4-1', DEFAULTS), [3, 2, 0, 1], 'qd (no reading: 0.75), qc (0.70), qa (0.30), qb (0.05)');
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2, 3], 'claude-opus-4-1', null), [0, 1, 2, 3]);
+  Object.assign(am.accounts[0].quota, { unified7d: 0.2 });
+  assert.deepEqual(rankByHeadroom(am, [0, 1, 2], 'claude-opus-4-1', DEFAULTS), [0, 2, 1], 'qa and qc tie: config order');
+  assert.deepEqual(rankByHeadroom(am, [2, 1, 0], 'claude-opus-4-1', DEFAULTS), [2, 0, 1], 'ties keep the order given');
+});
+
+test('the soft drain skips an account that cannot serve, and takes the most room even when every account is past', () => {
+  const am = new AccountManager(['qa', 'qb', 'qc'].map(name => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR })), 0.98);
+  const reset = Date.now() + 2 * HOUR;
+  Object.assign(am.accounts[0].quota, { unified5h: 0.9, unified5hReset: reset });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.99, unified7dReset: reset });
+  Object.assign(am.accounts[2].quota, { unified5h: 0.8, unified5hReset: reset });
+  assert.equal(softDrainIndex(am, [0, 1, 2], 'claude-opus-4-1', null, DEFAULTS), 2);
+  recordSeatRejection(am.accounts[2], { 'anthropic-ratelimit-unified-5h-status': 'rejected', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor(reset / 1000)) }, 'claude-opus-4-1');
+  assert.equal(softDrainIndex(am, [0, 1, 2], 'claude-opus-4-1', null, DEFAULTS), 1, 'qb (-0.09) over qa (-0.15) once qc cannot serve');
 });
 
 test('only a typed user prompt is a handoff moment, never a tool turn', () => {
@@ -502,12 +537,12 @@ test('a 5-hour reading of 0.80 is asked, and names the account a new conversatio
   });
 });
 
-test('a weekly reading of 0.85 is past neither threshold: not asked, and new conversations stay on qa', async () => {
+test('a weekly reading of 0.85 is past neither threshold: not asked, and a new conversation starts on the freer qb', async () => {
   await withGateway({ five: {}, week: { qa: 0.85 } }, async ({ send, seen, am }) => {
     assert.equal((await send()).status, 200);
     assert.equal((await send()).status, 200, 'not asked');
     assert.equal((await send({ opening: 'another task', pad: 100 })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qa']);
+    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
     assert.equal(am.handoffAsks.asked, 0);
   });
 });
@@ -531,14 +566,14 @@ test('soft drain applies to workers too', async () => {
   });
 });
 
-test('soft drain, every account past a threshold: queue order (qa), as today', async () => {
+test('soft drain, every account past a threshold: the one with the most room (qb)', async () => {
   await withGateway({ five: {} }, async ({ send, seen, am }) => {
     const reset = Date.now() + 2 * HOUR;
-    reading(am.accounts[0], { unified5h: 0.8, unified5hReset: reset });
+    reading(am.accounts[0], { unified5h: 0.9, unified5hReset: reset });
     reading(am.accounts[1], { unified7d: 0.95, unified7dReset: reset });
-    reading(am.accounts[2], { unified5h: 0.9, unified5hReset: reset });
+    reading(am.accounts[2], { unified5h: 0.85, unified5hReset: reset });
     assert.equal((await send({ opening: 'a new task', pad: 100 })).status, 200);
-    assert.deepEqual(seen, ['qa']);
+    assert.deepEqual(seen, ['qb']);
   });
 });
 
@@ -550,16 +585,27 @@ test('soft drain off: a new conversation starts on qa even when it is past', asy
   });
 });
 
-test('when no account qualifies for a new conversation, the ask keeps the "appears available" sibling wording', async () => {
-  await withGateway({}, async ({ send, am }) => {
+test('when the pinned account still has the most room, the ask names the freest sibling and no new-conversation account', async () => {
+  await withGateway({ five: { qa: 0.8 } }, async ({ send, am }) => {
     assert.equal((await send()).status, 200);
     const reset = Date.now() + 2 * HOUR;
-    reading(am.accounts[1], { unified7d: 0.95, unified7dReset: reset });
-    reading(am.accounts[2], { unified5h: 0.9, unified5hReset: reset });
+    reading(am.accounts[1], { unified5h: 0.95, unified5hReset: reset });
+    reading(am.accounts[2], { unified7d: 0.99, unified7dReset: reset });
     const asked = await send();
     assert.equal(asked.status, 429);
     const msg = asked.json?.error?.message ?? '';
-    assert.match(msg, /\("qb" appears available\)/);
+    assert.match(msg, /\("qc" appears available\)/, 'qc (-0.09) has more room than qb (-0.20)');
     assert.doesNotMatch(msg, /a new conversation will start on/);
+  });
+});
+
+test('new conversations start on the account with the most free space, not the first below the thresholds', async () => {
+  await withGateway({ five: {} }, async ({ send, seen, am }) => {
+    const reset = Date.now() + 48 * HOUR;
+    reading(am.accounts[0], { unified5h: 0.1, unified5hReset: reset, unified7d: 0.5, unified7dReset: reset });
+    reading(am.accounts[1], { unified5h: 0.1, unified5hReset: reset, unified7d: 0.2, unified7dReset: reset });
+    reading(am.accounts[2], { unified5h: 0.1, unified5hReset: reset, unified7d: 0.6, unified7dReset: reset });
+    assert.equal((await send({ opening: 'a new task', pad: 100 })).status, 200);
+    assert.deepEqual(seen, ['qb'], 'qb has 0.65 of room, qa 0.40, qc 0.30');
   });
 });
