@@ -71,7 +71,7 @@ async function withGateway({ handler = (_who, res) => ok(res), config: extra = {
   const port = await listen(proxy);
   // One turn of one conversation: the body identifies the conversation, so
   // `text` distinguishes conversations under one session id.
-  const send = async ({ key = KEYS.amy, session = 's-1', text = 'hello', policy, advisor } = {}) => {
+  const send = async ({ key = KEYS.amy, session = 's-1', text = 'hello', policy, order, advisor } = {}) => {
     const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -79,6 +79,7 @@ async function withGateway({ handler = (_who, res) => ok(res), config: extra = {
         'x-api-key': key,
         'x-claude-code-session-id': session,
         ...(policy === undefined ? {} : { 'x-teamclaude-seat-policy': policy }),
+        ...(order === undefined ? {} : { 'x-teamclaude-seat-order': order }),
       },
       body: JSON.stringify({
         model: 'claude-opus-4-1',
@@ -411,5 +412,99 @@ test('handoffBeforeSwitch off: the continuation keeps config order', async () =>
     assert.equal(continued.status, 200);
     assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
     assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+  });
+});
+
+// The seat priority queue (x-teamclaude-seat-order): the caller's preference
+// among its own route's accounts. Route s1+s2+s3 is qa, qb, qc.
+
+test('seat order: a new conversation starts on the first listed account, and the header never reaches upstream', async () => {
+  await withGateway({}, async ({ send, seen, attempts }) => {
+    assert.equal((await send({ text: 'one', order: 's3,s1' })).status, 200);
+    assert.equal((await send({ text: 'one', order: 's3,s1' })).status, 200);
+    assert.deepEqual(seen, ['qc', 'qc']);
+    assert.equal(attempts[0].headers['x-teamclaude-seat-order'], undefined, 'the order header reached upstream');
+  });
+});
+
+test('seat order: a listed account past a handoff threshold yields to the next listed one with room', async () => {
+  await withGateway({}, async ({ send, seen, am }) => {
+    weekly(am, { 0: 0.5, 1: 0.1, 2: 0.95 });
+    assert.equal((await send({ text: 'one', order: 's3,s1' })).status, 200);
+    assert.deepEqual(seen, ['qa'], 'qc is past 90% weekly; qa is listed next, ahead of the freer qb');
+  });
+});
+
+test('seat order: when the first listed account is spent, the offer names the next listed one and the continuation goes there', async () => {
+  let qcSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qc' && qcSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+    assert.equal((await send({ order: 's3,s1' })).status, 200);
+    weekly(am, { 0: 0.5, 1: 0.1 });
+    qcSpent = true;
+    const stopped = await send({ order: 's3,s1' });
+    assert.equal(stopped.status, 429);
+    const msg = stopped.json?.error?.message ?? '';
+    assert.ok(msg.includes('"qa" appears available'), msg);
+    const continued = await send({ order: 's3,s1' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qa;cold-cache=true');
+    assert.deepEqual(seen, ['qc', 'qc', 'qa']);
+  });
+});
+
+test('seat order: force hops to the next listed account', async () => {
+  let qcSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qc' && qcSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+    const headers = { order: 's3,s1', policy: '*=force' };
+    assert.equal((await send(headers)).status, 200);
+    weekly(am, { 0: 0.5, 1: 0.1 });
+    qcSpent = true;
+    const forced = await send(headers);
+    assert.equal(forced.status, 200);
+    assert.equal(forced.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qa;cold-cache=true');
+    assert.deepEqual(seen, ['qc', 'qc', 'qa']);
+  });
+});
+
+test('seat order: a stale slug and another route\'s seat are skipped, never served', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ text: 'one', order: 'gone,s2' })).status, 200);
+    assert.equal((await send({ text: 'two', order: 'seat-r' })).status, 200);
+    assert.equal((await send({ text: 'three', order: 'seat-r,s3' })).status, 200);
+    assert.deepEqual(seen, ['qb', 'qa', 'qc'], 'seat-r (qr) is ben\'s route');
+  });
+});
+
+test('seat order: a malformed header is ignored whole', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ text: 'one', order: 's3,,s1' })).status, 200);
+    assert.equal((await send({ text: 'two', order: ['s3', ...Array.from({ length: 64 }, (_, i) => `x${i}`)].join(',') })).status, 200);
+    assert.equal((await send({ text: 'three', order: 's3,s3' })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa', 'qa']);
+  });
+});
+
+test('seat order: a pinned conversation is not moved by a change of order', async () => {
+  await withGateway({}, async ({ send, seen }) => {
+    assert.equal((await send({ order: 's2' })).status, 200);
+    assert.equal((await send({ order: 's3' })).status, 200);
+    assert.equal((await send({})).status, 200);
+    assert.deepEqual(seen, ['qb', 'qb', 'qb']);
+  });
+});
+
+test('seat order, handoffBeforeSwitch off: the listed accounts first, then config order', async () => {
+  let qcSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qc' && qcSpent ? spent(res) : ok(res)), config: { handoffBeforeSwitch: false } }, async ({ send, seen, am }) => {
+    weekly(am, { 0: 0.1, 1: 0.95 });
+    assert.equal((await send({ order: 's3,s2' })).status, 200);
+    qcSpent = true;
+    const stopped = await send({ order: 's3,s2' });
+    const msg = stopped.json?.error?.message ?? '';
+    assert.ok(msg.includes('"qb" appears available'), `qb is listed next; config order would name qa: ${msg}`);
+    const continued = await send({ order: 's3,s2' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qb;cold-cache=true');
+    assert.deepEqual(seen, ['qc', 'qc', 'qb']);
   });
 });

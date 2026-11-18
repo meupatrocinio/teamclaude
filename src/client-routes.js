@@ -67,14 +67,9 @@ const SEAT_POLICY_MODES = new Set(['force', 'recommend']);
 export function parseSeatPolicies(rawHeader, route, indices) {
   /** @type {Map<number, 'force'|'recommend'>} */
   const empty = new Map();
-  const slugs = route.name.split('+');
-  if (slugs.length !== route.accounts.length || slugs.length !== indices.length
-      || new Set(slugs).size !== slugs.length || new Set(indices).size !== indices.length
-      || slugs.some(s => !SEAT_SLUG.test(s)) || indices.some(i => !Number.isInteger(i))) return empty;
-  if (typeof rawHeader !== 'string' || !rawHeader.trim()) return empty;
-  if (rawHeader.length > 4096) return empty;
-  const entries = rawHeader.split(',');
-  if (entries.length > 64) return empty;
+  const slugs = routeSlugs(route, indices);
+  const entries = slugs ? seatHeaderEntries(rawHeader) : null;
+  if (!slugs || !entries) return empty;
   /** @type {Map<string, 'force'|'recommend'>} */
   const parsed = new Map();
   for (const entry of entries) {
@@ -89,6 +84,63 @@ export function parseSeatPolicies(rawHeader, route, indices) {
   const fallback = parsed.get('*') ?? 'recommend';
   const out = new Map();
   slugs.forEach((slug, i) => out.set(indices[i], parsed.get(slug) ?? fallback));
+  return out;
+}
+
+/**
+ * The seat slugs of a renderer-produced route (`slug+slug`), one per resolved
+ * account in the same order, or null when the name does not map one to one.
+ * @param {ClientRoute} route
+ * @param {number[]} indices
+ * @returns {string[]|null}
+ */
+function routeSlugs(route, indices) {
+  const slugs = route.name.split('+');
+  if (slugs.length !== route.accounts.length || slugs.length !== indices.length
+      || new Set(slugs).size !== slugs.length || new Set(indices).size !== indices.length
+      || slugs.some(s => !SEAT_SLUG.test(s)) || indices.some(i => !Number.isInteger(i))) return null;
+  return slugs;
+}
+
+/**
+ * The comma-separated entries of a per-request seat header, or null when it
+ * is absent, empty or over the size limits.
+ * @param {unknown} rawHeader
+ * @returns {string[]|null}
+ */
+function seatHeaderEntries(rawHeader) {
+  if (typeof rawHeader !== 'string' || !rawHeader.trim() || rawHeader.length > 4096) return null;
+  const entries = rawHeader.split(',');
+  return entries.length > 64 ? null : entries;
+}
+
+/**
+ * The caller's seat priority queue (`x-teamclaude-seat-order: slug,slug`)
+ * resolved against its own route: the listed accounts' indices in the
+ * caller's order. A well-formed slug that is not on this route (stale, or
+ * another route's) is skipped, so the header can never reach an account the
+ * key is not bound to. A malformed header (an empty or invalid entry, a
+ * repeated slug, over the size limits) is ignored whole.
+ *
+ * @param {unknown} rawHeader
+ * @param {ClientRoute} route
+ * @param {number[]} indices
+ * @returns {number[]}
+ */
+export function parseSeatOrder(rawHeader, route, indices) {
+  const slugs = routeSlugs(route, indices);
+  const entries = slugs ? seatHeaderEntries(rawHeader) : null;
+  if (!slugs || !entries) return [];
+  const seen = new Set();
+  /** @type {number[]} */
+  const out = [];
+  for (const entry of entries) {
+    const slug = entry.trim();
+    if (!SEAT_SLUG.test(slug) || seen.has(slug)) return [];
+    seen.add(slug);
+    const at = slugs.indexOf(slug);
+    if (at !== -1) out.push(indices[at]);
+  }
   return out;
 }
 

@@ -27,7 +27,9 @@
 // conversation with no pin on the seat starts on the servable account with the
 // most room (softDrainIndex), and a continuation moves in that order too, so
 // the handoff's new conversation, and every new task, lands on the freest
-// account while pinned conversations keep their warm one to the limit.
+// account while pinned conversations keep their warm one to the limit. A
+// caller's seat priority queue (`x-teamclaude-seat-order`) puts its listed
+// accounts first inside each part, those with room and those past.
 //
 // This module holds the parts that need no server: the setting, the readings,
 // the decision, the soft-drain pick and the answer. The server supplies the facts (server.js
@@ -202,44 +204,69 @@ export function handoffHeadroom(windows, settings, now) {
 }
 
 /**
- * A seat's accounts ordered by free space: most handoff headroom first
- * (handoffHeadroom), equal room in the order given (config order). With the
- * setting off (`settings` null) the order given, unchanged. Reads only; does
- * not filter out accounts that cannot serve.
+ * `indices` with the caller's listed accounts (`order`, the seat priority
+ * queue) first, in the caller's order, then the rest in the order given. An
+ * entry of `order` that is not in `indices` is skipped.
+ *
+ * @param {number[]} indices
+ * @param {number[]|null|undefined} order
+ * @returns {number[]}
+ */
+export function preferSeatOrder(indices, order) {
+  if (!order?.length) return indices;
+  const listed = order.filter(i => indices.includes(i));
+  return [...listed, ...indices.filter(i => !listed.includes(i))];
+}
+
+/**
+ * A seat's accounts in the order to try them. While the setting is on:
+ * accounts with room before their handoff thresholds (handoffHeadroom above
+ * 0) first, then those past one; inside each part the caller's listed
+ * accounts (`order`) in its order, then the rest by most headroom, equal room
+ * in the order given (config order). With no `order` that is plain free-space
+ * order. With the setting off (`settings` null): the listed accounts, then
+ * the rest in the order given. Reads only; does not filter out accounts that
+ * cannot serve.
  *
  * @param {any} accountManager
  * @param {number[]} indices
  * @param {string|null} model
  * @param {HandoffSettings|null} settings
+ * @param {number[]|null} [order]  the caller's seat priority queue (client-routes.js parseSeatOrder)
  * @param {number} [now]
  * @returns {number[]}
  */
-export function rankByHeadroom(accountManager, indices, model, settings, now = Date.now()) {
-  if (!settings) return indices;
+export function rankByHeadroom(accountManager, indices, model, settings, order = null, now = Date.now()) {
+  if (!settings) return preferSeatOrder(indices, order);
   const ranked = indices.map((i, pos) => {
     const account = accountManager.accounts[i];
     return { i, pos, room: account ? handoffHeadroom(handoffWindows(accountManager, account, model), settings, now) : -Infinity };
   });
   ranked.sort((a, b) => (b.room > a.room ? 1 : b.room < a.room ? -1 : a.pos - b.pos));
-  return ranked.map(e => e.i);
+  if (!order?.length) return ranked.map(e => e.i);
+  return [
+    ...preferSeatOrder(ranked.filter(e => e.room > 0).map(e => e.i), order),
+    ...preferSeatOrder(ranked.filter(e => !(e.room > 0)).map(e => e.i), order),
+  ];
 }
 
 /**
  * The soft drain: the account a conversation with no pin on a seat starts on,
- * the servable account of `candidates` with the most free space
- * (rankByHeadroom), even when every one is past a threshold, or null when
- * none can serve. Reads only.
+ * the first servable account of `candidates` in rankByHeadroom order (the
+ * caller's queue among those with room, else the most free space), even when
+ * every one is past a threshold, or null when none can serve. Reads only.
  *
  * @param {any} accountManager
  * @param {number[]} candidates
  * @param {string|null} model
  * @param {string|null} advisorModel
  * @param {HandoffSettings} settings
+ * @param {number[]|null} [order]
  * @param {number} [now]
  * @returns {number|null}
  */
-export function softDrainIndex(accountManager, candidates, model, advisorModel, settings, now = Date.now()) {
-  for (const i of rankByHeadroom(accountManager, candidates, model, settings, now)) {
+export function softDrainIndex(accountManager, candidates, model, advisorModel, settings, order = null, now = Date.now()) {
+  for (const i of rankByHeadroom(accountManager, candidates, model, settings, order, now)) {
     const account = accountManager.accounts[i];
     if (account && !seatVerdict(accountManager, account, model, advisorModel, now)) return i;
   }

@@ -13,7 +13,7 @@ import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { stampGatewayUser } from './user-identity.js';
-import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus, norm } from './client-routes.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, parseSeatOrder, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus, norm } from './client-routes.js';
 import { createContinuationTelemetry } from './continuation-telemetry.js';
 import { parseRequestModel, parseAdvisorModel, refreshHeldUntil } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
@@ -29,7 +29,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
-import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt, softDrainIndex, rankByHeadroom } from './handoff-before-switch.js';
+import { resolveHandoffBeforeSwitch, decideHandoffBeforeSwitch, handoffWindows, handoffAskAnswer, lastMessageIsTypedPrompt, softDrainIndex, rankByHeadroom, preferSeatOrder } from './handoff-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -427,6 +427,7 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
 
 const SEAT_INTERNAL_HEADERS = new Set([
   'x-teamclaude-seat-policy',
+  'x-teamclaude-seat-order',
   'x-teamclaude-seat-failover',
   // AI-1903 (C7/E7): the cg contract version header gates the owner-root 429
   // paragraph; it is ours, never upstream's, on every path.
@@ -1165,7 +1166,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const callerPolicy = req.tcClient ? callerContinuationPolicy(policyTable, req.tcClient, req.tcKeyHash ?? null) : undefined;
         res.end(JSON.stringify({
           ...extra, ...status, ...routing,
-          capabilities: { continuationPolicies: 1, workerIdentity: true },
+          capabilities: { continuationPolicies: 1, workerIdentity: true, seatOrder: true },
           ...adminPolicies,
           caller: callerView(req.tcClient, auth.scope, seat, callerPolicy),
           upstreamPool: upstreamPoolStatus(),
@@ -2761,7 +2762,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // direct request carries its key as req.tcClient, a MITM tunnel as
       // forcedClient (fixed at CONNECT), and a request with neither is the
       // shared proxy key or key-less loopback.
-      /** @type {{ route: string, indices: number[], policies: Map<number, 'force'|'recommend'> }|null} */
+      /** @type {{ route: string, indices: number[], policies: Map<number, 'force'|'recommend'>, order: number[] }|null} */
       let bound = null;
       /** @type {string|null} */
       let gate = null;
@@ -2831,6 +2832,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
                 policies: root
                   ? new Map(r.indices.map((/** @type {number} */ i) => [i, root.mode]))
                   : parseSeatPolicies(req.headers['x-teamclaude-seat-policy'], routed, r.indices),
+                // The caller's seat priority queue: a preference among its own
+                // route's accounts, never a pin and never another route's.
+                order: parseSeatOrder(req.headers['x-teamclaude-seat-order'], routed, r.indices),
               };
               if (r.indices.length === 1) pinnedIndex = r.indices[0];
             }
@@ -3070,7 +3074,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // affinity bookkeeping; it is never upstream's either. The dominant
       // forward path strips from THIS list — SEAT_INTERNAL_HEADERS alone does
       // not cover it.
-      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy', 'x-teamclaude-cg-contract', 'x-teamclaude-worker-id']);
+      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy', 'x-teamclaude-seat-order', 'x-teamclaude-cg-contract', 'x-teamclaude-worker-id']);
 
       // The SQLite usage row's `caller` (distinct from `client`: never null,
       // so a caller with no clientKeys entry is still one dimension value
@@ -3370,7 +3374,7 @@ function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey,
  *
  * @param {any} accountManager
  * @param {any} config
- * @param {{ method: string|undefined, url: string|undefined, body: Buffer, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null, bound: { route: string, indices: number[], policies: Map<number, 'force'|'recommend'> } }} request
+ * @param {{ method: string|undefined, url: string|undefined, body: Buffer, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null, bound: { route: string, indices: number[], policies: Map<number, 'force'|'recommend'>, order: number[] } }} request
  * @returns {{ account: Record<string, any>, window: import('./handoff-before-switch.js').QuotaWindow, sibling: string, fresh: string|null, settings: import('./handoff-before-switch.js').HandoffSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string, route: string }|null}
  */
 function handoffAskFor(accountManager, config, { method, url, body, pinKey, sessionId, model, advisorModel, bound }) {
@@ -3386,7 +3390,7 @@ function handoffAskFor(accountManager, config, { method, url, body, pinKey, sess
     const pinned = pinIdx != null && bound.indices.includes(pinIdx) ? pinIdx : null;
     const account = pinned == null ? null : accountManager.accounts[pinned];
     if (!account || !accountSupportsModel(account, model) || !accountSupportsModel(account, advisorModel)) return null;
-    const next = nextInSeatQueueIndex(accountManager, rankByHeadroom(accountManager, bound.indices, model, settings), pinned, model, advisorModel);
+    const next = nextInSeatQueueIndex(accountManager, rankByHeadroom(accountManager, bound.indices, model, settings, bound.order), pinned, model, advisorModel);
     const sibling = next == null ? null : accountManager.accounts[next]?.name ?? null;
     const decision = decideHandoffBeforeSwitch({
       settings, bodyBytes, pinKey, sessionId, asks, pinned, sibling,
@@ -3396,7 +3400,7 @@ function handoffAskFor(accountManager, config, { method, url, body, pinKey, sess
     });
     if (!decision.ask || !decision.window || !sibling) return null;
     if (!lastMessageIsTypedPrompt(body)) return null;
-    const freshIdx = softDrainIndex(accountManager, bound.indices, model, advisorModel, settings);
+    const freshIdx = softDrainIndex(accountManager, bound.indices, model, advisorModel, settings, bound.order);
     const fresh = freshIdx == null || freshIdx === pinned ? null : accountManager.accounts[freshIdx]?.name ?? null;
     return { account, window: decision.window, sibling, fresh, settings, asks, pinKey, sessionId, route: bound.route };
   } catch (/** @type {any} */ err) {
@@ -4922,21 +4926,25 @@ function respondContinuationStopped(res, ctx, shownAccount) {
 
 /**
  * A seat's accounts in the order a conversation moves onto them (IPM fork):
- * most free space first (rankByHeadroom) while handoffBeforeSwitch is on, so
- * the account a message names is the one the conversation goes to; config
- * order when it is off or the ranking fails.
+ * while handoffBeforeSwitch is on, those with room before the handoff
+ * thresholds, then those past, each part with the caller's seat priority
+ * queue (ctx.bound.order) first and the rest by free space (rankByHeadroom),
+ * so the account a message names is the one the conversation goes to. With
+ * the setting off, or when the ranking fails: the caller's queue, then config
+ * order.
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
  * @param {number[]} indices
  * @returns {number[]}
  */
 function seatOrder(accountManager, ctx, indices) {
-  if (!ctx.handoffSettings) return indices;
+  const order = ctx.bound?.order ?? null;
+  if (!ctx.handoffSettings) return preferSeatOrder(indices, order);
   try {
-    return rankByHeadroom(accountManager, indices, ctx.model, ctx.handoffSettings);
+    return rankByHeadroom(accountManager, indices, ctx.model, ctx.handoffSettings, order);
   } catch (/** @type {any} */ err) {
     reportFailure('[TeamClaude] handoffBeforeSwitch: ranking the seat by free space failed, keeping queue order:', err);
-    return indices;
+    return preferSeatOrder(indices, order);
   }
 }
 
@@ -5025,14 +5033,15 @@ function pickBoundAccount(accountManager, ctx) {
   let drained = null;
   if (ctx.handoffSettings) {
     try {
-      drained = softDrainIndex(accountManager, candidates, ctx.model, ctx.advisorModel, ctx.handoffSettings);
+      drained = softDrainIndex(accountManager, candidates, ctx.model, ctx.advisorModel, ctx.handoffSettings, ctx.bound.order);
     } catch (/** @type {any} */ err) {
       reportFailure('[TeamClaude] handoffBeforeSwitch: the soft drain failed, keeping queue order:', err);
     }
   }
-  const servable = drained ?? candidates.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+  const queue = preferSeatOrder(candidates, ctx.bound.order);
+  const servable = drained ?? queue.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
   ctx.boundPinned = incompatiblePin;
-  return accountManager.accounts[servable ?? candidates[0]] ?? null;
+  return accountManager.accounts[servable ?? queue[0]] ?? null;
 }
 
 /**
