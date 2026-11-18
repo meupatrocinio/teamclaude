@@ -533,13 +533,14 @@ const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
 export const CG_SEAT_POLICY_ROOT_PARAGRAPH = 'To make all local and remote workers using this key continue automatically on every assigned seat, run `cg seat-policy force`. This durable owner-wide policy takes effect on the next request; run `cg seat-policy recommend` to restore confirmations.';
 
 /**
- * The next account in a seat's queue that can serve now, in config order,
- * skipping the conversation's pinned (spent) one — the account a fresh,
- * handoff-ed conversation would land on. Queue order, not least-loaded: the
- * seat's quota drains one account at a time, and an earlier account whose
- * window has since reset is servable again and correctly found first.
+ * The next account in a seat's queue that can serve now, in the order of
+ * `indices`, skipping the conversation's pinned (spent) one — the account a
+ * fresh, handoff-ed conversation would land on. Callers pass the seat's
+ * accounts by free space while handoffBeforeSwitch is on (server.js
+ * seatOrder), else in config order, where an earlier account whose window has
+ * since reset is servable again and correctly found first.
  * @param {any} accountManager
- * @param {number[]} indices  the seat's accounts, in config order
+ * @param {number[]} indices  the seat's accounts, in the order to try them
  * @param {number} currentIdx  the pinned account the answer is about
  * @param {string|null} [model]
  * @param {string|null} [advisorModel]

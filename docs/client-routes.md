@@ -25,13 +25,14 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
 - A client listed on two routes is **ambiguous**. Neither route applies, and the key gets
   "seat unavailable".
 - A route with several accounts is allowed. Its requests stay inside those accounts, and failover
-  hops move only between them. The account list is a **drain queue in config order**: a
-  conversation pins to the first account it starts on. Each account has a per-request quota policy,
-  selected by the caller (`recommend` by default, or `force`). The source account's policy governs
-  each move. Fresh conversations take the first servable account immediately, so the seat's quota
-  drains one account at a time instead of spreading across all of them at once. While
-  `handoffBeforeSwitch` is on, that is the first servable account past neither handoff threshold
-  (the [soft drain](#soft-drain)), so a new conversation does not open on an account about to run out.
+  hops move only between them. The account list is a **queue**: a conversation pins to the account
+  it starts on. Each account has a per-request quota policy, selected by the caller (`recommend` by
+  default, or `force`). The source account's policy governs each move. While `handoffBeforeSwitch`
+  is on, the queue is ordered by **free space**: a fresh conversation, and a conversation moving off
+  a spent account, takes the servable account with the most room before its handoff thresholds
+  (the [soft drain](#soft-drain)), so new work does not open on an account about to run out.
+  With the setting off, the queue is config order and fresh conversations take the first servable
+  account, so the seat's quota drains one account at a time.
 
   - `recommend`: while the pinned account still serves, a large conversation near one of its
     quota windows is told once to run `/ipm:handoff` (see [Handoff before the limit](#handoff-before-the-limit)).
@@ -39,7 +40,7 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
     context with a cold prompt cache, and offers a new conversation or waiting for the reset. A
     later prompt in that same conversation confirms the switch once and re-pins there.
   - `force`: the first real quota failure immediately retries the identical request body on the
-    first assigned account that can serve, preserving the conversation, and re-pins there. Every
+    next assigned account in the queue that can serve, preserving the conversation, and re-pins there. Every
     force hop is independently authorized by the account that just failed.
 
   If the destination also spends out, its own policy applies: a recommend destination offers and
@@ -205,8 +206,10 @@ handoff. When several windows are past, the one furthest past its own threshold 
 The answer is a 429 `rate_limit_error` with `x-should-retry: false` and no unified headers, the same
 shape as the post-limit offer, so Claude Code shows its text. It names the pinned account, the
 window and its percentage, the reset as a relative time when known, the account a new conversation
-will start on (the soft drain's pick; when none qualifies, the sibling that appears available), and
-the choices: run `/ipm:handoff` now, or send any prompt to keep going on the pinned account. The ask is recorded
+will start on (the soft drain's pick, left out when that pick is the pinned account itself, which
+happens only when it still has the most room), the sibling that appears available (the next account
+by free space), and the choices: run `/ipm:handoff` now, or send any prompt to keep going on the
+pinned account. The ask is recorded
 before the answer is written, so the next prompt of that conversation, the handoff included, is
 forwarded to the warm account. Each ask writes one log line naming the session, seat, account,
 window and sibling, and shows in the activity log with status `429` and
@@ -217,12 +220,26 @@ the request.
 
 ### Soft drain
 
-With the same thresholds, while the setting is on, a seat of two or more accounts places a
-conversation that has no compatible pin on it on the first servable account in queue order that is
-past neither threshold. When none qualifies, it keeps plain queue order. It applies under any
-policy, workers included. A pinned conversation is never moved by it: it keeps its warm account
-until that account is spent, and the handoff's new conversation, like every new task, starts on the
-fresh account. The thresholds are read once when the request is admitted.
+With the same thresholds, while the setting is on, a seat of two or more accounts ranks its
+accounts by free space: an account's room is its tightest window, the 5-hour one measured against
+`fiveHourUtilization` and every weekly one against `weeklyUtilization`. A window with no reading, or
+one that has already reset, counts as unused. A conversation that has no compatible pin on the seat
+starts on the servable account with the most room; accounts with equal room (no readings yet, for
+example) keep config order. When every account is past a threshold, the one with the most room
+still wins. The same order picks where a conversation goes when its pinned account is spent (the
+recommend continuation and the force hop), and the account the post-limit offer and the handoff ask
+name. The order is read again on every request, so a message names the account that appears
+available when it is written; answers in between can change which account the move takes.
+
+Ordering by free space spreads new conversations over every account with room, instead of
+draining one account at a time. The accounts then fill together, so their windows also tend to run
+out closer together; the handoff ask and the continuation still cover each conversation as its own
+account nears its limit.
+
+It applies under any policy, workers included. A pinned conversation is never moved by it: it keeps
+its warm account until that account is spent. Because readings arrive only with answers, a burst of
+new conversations before the next answer lands on the same account. The thresholds are read once
+when the request is admitted.
 
 ## Operator overrides
 

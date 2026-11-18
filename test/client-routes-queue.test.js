@@ -5,12 +5,14 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { recordSeatRejection, seatVerdict } from '../src/client-routes.js';
 
-// The seat queue (IPM fork): a multi-account seat is a drain queue in config
-// order. The first quota failure on a pinned conversation offers the choices
+// The seat queue (IPM fork): a multi-account seat is a queue of accounts,
+// most free space first while handoffBeforeSwitch is on (equal room, e.g. no
+// readings yet, keeps config order), config order when it is off. The first
+// quota failure on a pinned conversation offers the choices
 // (continue cold, start a new conversation, or wait for the reset) and
 // discloses the cold-cache continuation; the next prompt in that same
 // conversation confirms it and moves once. A fresh conversation still advances
-// without that ceremony. Quota is spent one account at a time, not spread.
+// without that ceremony.
 
 const HOUR = 3600_000;
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
@@ -43,7 +45,7 @@ const spent = (res) => {
   res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
 };
 
-async function withGateway({ handler = (_who, res) => ok(res) } = {}, fn) {
+async function withGateway({ handler = (_who, res) => ok(res), config: extra = {} } = {}, fn) {
   const seen = [];
   const attempts = [];
   const upstream = http.createServer(async (req, res) => {
@@ -63,6 +65,7 @@ async function withGateway({ handler = (_who, res) => ok(res) } = {}, fn) {
   const config = {
     proxy: { apiKey: ADMIN, clientKeys: Object.entries(KEYS).map(([name, key]) => ({ name, key })), requireClientRoute: true },
     upstream: `http://127.0.0.1:${upPort}`,
+    ...extra,
   };
   const proxy = createProxyServer(am, config);
   const port = await listen(proxy);
@@ -106,7 +109,7 @@ test('a conversation on a multi-account seat stays on the queue head across turn
   });
 });
 
-test('fresh conversations drain the queue head too — quota is not spread across the seat', async () => {
+test('with no readings, fresh conversations keep the queue head: equal room keeps config order', async () => {
   await withGateway({}, async ({ send, seen }) => {
     for (const text of ['conv one', 'conv two', 'conv three']) {
       assert.equal((await send({ text })).status, 200);
@@ -357,5 +360,56 @@ test('a single-account seat is unchanged: spent is a hard stop with no queue hin
     const forced = await send({ key: KEYS.ben, policy: '*=force' });
     assert.equal(forced.status, 429, 'force cannot invent a sibling for a single-account route');
     assert.ok(forced.headers.get('anthropic-ratelimit-unified-7d-reset'), 'the ordinary spent headers are retained');
+  });
+});
+
+/** Weekly readings, as if upstream had reported them. @param {any} am @param {Record<number, number>} byIndex */
+const weekly = (am, byIndex) => {
+  for (const [i, u] of Object.entries(byIndex)) Object.assign(am.accounts[Number(i)].quota, { unified7d: u, unified7dReset: Date.now() + 48 * HOUR });
+};
+
+test('the continuation goes to the account with the most free space, and the offer names it', async () => {
+  let qaSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    weekly(am, { 1: 0.8, 2: 0.1 });
+    qaSpent = true;
+    const stopped = await send({ text: 'hello' });
+    assert.equal(stopped.status, 429);
+    const msg = stopped.json?.error?.message ?? '';
+    assert.ok(msg.includes('"qc" appears available'), msg);
+    assert.ok(msg.includes('currently "qc"'), msg);
+    const continued = await send({ text: 'hello' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true');
+    assert.deepEqual(seen, ['qa', 'qa', 'qc']);
+  });
+});
+
+test('force hops to the account with the most free space', async () => {
+  let qaSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+    assert.equal((await send({ text: 'hello', policy: '*=recommend,s1=force' })).status, 200);
+    weekly(am, { 1: 0.8, 2: 0.1 });
+    qaSpent = true;
+    const forced = await send({ text: 'hello', policy: '*=recommend,s1=force' });
+    assert.equal(forced.status, 200);
+    assert.equal(forced.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true');
+    assert.deepEqual(seen, ['qa', 'qa', 'qc']);
+  });
+});
+
+test('handoffBeforeSwitch off: the continuation keeps config order', async () => {
+  let qaSpent = false;
+  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)), config: { handoffBeforeSwitch: false } }, async ({ send, seen, am }) => {
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    weekly(am, { 1: 0.8, 2: 0.1 });
+    qaSpent = true;
+    const stopped = await send({ text: 'hello' });
+    assert.ok((stopped.json?.error?.message ?? '').includes('"qb" appears available'));
+    const continued = await send({ text: 'hello' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
+    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
   });
 });
