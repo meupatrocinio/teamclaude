@@ -113,8 +113,8 @@ test('applies modelMap before modelPrefix exactly once', () => {
   }).model, 'gemini-3-pro-preview');
 });
 
-test('maps only low/medium/high reasoning effort', () => {
-  for (const effort of ['low', 'medium', 'high']) {
+test('maps only low/medium/high/xhigh reasoning effort', () => {
+  for (const effort of ['low', 'medium', 'high', 'xhigh']) {
     assert.equal(translated({ output_config: { effort } }).reasoning_effort, effort);
   }
   for (const effort of ['default', 'auto', undefined]) {

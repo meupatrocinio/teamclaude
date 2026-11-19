@@ -229,13 +229,25 @@ test('in-array system messages preserve the Claude Code role sequence', async ()
   }
 });
 
+test('xhigh effort reaches the sidecar as reasoning_effort (AI-2050)', async () => {
+  const ctx = await fixture();
+  try {
+    const res = await ctx.post(request(false, { output_config: { effort: 'xhigh' } }));
+    assert.equal(res.status, 200, res.body);
+    assert.equal(ctx.agyRequests.length, 1);
+    assert.equal(ctx.agyRequests[0].body.reasoning_effort, 'xhigh');
+  } finally {
+    await ctx.close();
+  }
+});
+
 test('unsupported requests and count_tokens are refused before either upstream', async () => {
   const ctx = await fixture();
   try {
     const invalid = [
       request(false, { tools: [{ name: 'external' }] }),
       request(false, { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] }),
-      request(false, { output_config: { effort: 'xhigh' } }),
+      request(false, { output_config: { effort: 'max' } }),
       request(false, { thinking: { type: 'enabled' } }),
       request(false, { thinking: { type: 'adaptive', display: 'visible' } }),
       request(false, { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'none' }] } }),
