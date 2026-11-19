@@ -4763,8 +4763,9 @@ function seatPolicyFor(ctx, accountIndex) {
  * Answer a bound request whose seat cannot serve it (IPM fork). Never another
  * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
  * When the request was pinned to one account of a multi-account seat
- * (ctx.boundPinned) and that account is spent, the answer names the next
- * servable account in the seat's queue and the choices: continue this
+ * (ctx.boundPinned), that account is spent and its recommend continuation was
+ * refused by the hop cap (hopForcedSeat), the answer names
+ * the next servable account in the seat's queue and the choices: continue this
  * conversation there with a cold cache, start a new conversation, or wait for
  * the pinned account to reset.
  * @param {any} res
@@ -4820,7 +4821,9 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
 }
 
 /**
- * A force-mode quota hop to another account of the same bound seat. The explicit
+ * A quota hop to another account of the same bound seat once the pinned
+ * account is spent. Both policies hop (AI-2049): they differ only before the
+ * end, where recommend gets the handoff ask and force does not. The explicit
  * hop bypasses offer consumption and keeps the destination's own policy/pin
  * semantics; the original request body is reused by the caller.
  *
@@ -4831,6 +4834,9 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
  * - arch plan 9: at most MAX_CONTINUATION_HOPS armed hops per admitted request
  *   (each armed hop is exactly one continuation upstream attempt), then the
  *   request ends (ctx.continuationStopped = 'cap').
+ * A revoked key stops either policy. A recommend hop refused by the cap sets
+ * no ctx.continuationStopped: it gets the recommend answer it had before
+ * AI-2049 (respondSeat, the offer).
  *
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
@@ -4839,14 +4845,14 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
  * @returns {boolean} whether ctx.hopTo now names a servable sibling
  */
 function hopForcedSeat(accountManager, ctx, account, verdict) {
-  if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null
-      || verdict.kind !== 'spent' || seatPolicyFor(ctx, account.index) !== 'force') return false;
+  if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null || verdict.kind !== 'spent') return false;
+  const mode = seatPolicyFor(ctx, account.index);
   if (ctx.keyHash && !clientKeyStillCurrent(ctx.proxyConfig, ctx.client, ctx.keyHash)) {
     ctx.continuationStopped = 'key-revoked';
     return false;
   }
   if ((ctx.continuationHops ?? 0) >= MAX_CONTINUATION_HOPS) {
-    ctx.continuationStopped = 'cap';
+    if (mode === 'force') ctx.continuationStopped = 'cap';
     return false;
   }
   const excluded = new Set([...ctx.tried, ...(ctx.rolledOff ?? [])]);
@@ -4860,7 +4866,7 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
     from: ctx.seatContinuation?.from ?? account.name,
     to: destination.name,
     coldCache: true,
-    policy: 'force',
+    policy: mode,
   };
   // AI-1959: the durable attempt event is recorded at the send point, not
   // here — hop arming runs before the pre-send re-checks (entitlement, cap,
@@ -4869,16 +4875,16 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
   // the attempt's account is the destination named here; the event's hop
   // number is assigned there too, so it numbers continuation SENDS, not
   // armings (an armed-but-never-sent hop leaves no gap and no collision).
-  ctx.pendingContinuationEvent = { mode: 'force', from: account.name, to: destination.name };
-  console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
+  ctx.pendingContinuationEvent = { mode, from: account.name, to: destination.name };
+  console.log(`[TeamClaude] Seat ${mode} continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
   return true;
 }
 
 /**
- * Hard cap on armed force continuation hops per admitted request (arch plan
- * 9): each armed hop sends the full conversation to one more upstream account,
- * so the cap bounds what one admitted request can spend under an owner-wide
- * force root. The cap counts hops, not the initial attempt.
+ * Hard cap on armed continuation hops per admitted request (arch plan 9): each
+ * armed hop sends the full conversation to one more upstream account, so the
+ * cap bounds what one admitted request can spend under an owner-wide root,
+ * force or recommend. The cap counts hops, not the initial attempt.
  */
 const MAX_CONTINUATION_HOPS = 8;
 
@@ -4899,9 +4905,9 @@ function clientKeyStillCurrent(proxyConfig, client, keyHash) {
 }
 
 /**
- * The non-unified 429 a force continuation ends with when the per-request hop
- * cap is reached or the key was revoked mid-request (AI-1903, arch plan 9 /
- * E11). No unified headers (it is not an upstream window verdict), no C7
+ * The non-unified 429 a continuation ends with when the key was revoked
+ * mid-request (either policy), or when a force continuation reaches the
+ * per-request hop cap (AI-1903, arch plan 9 / E11). No unified headers (it is not an upstream window verdict), no C7
  * paragraph, and `x-should-retry: false` so the client stops.
  * @param {any} res
  * @param {Record<string, any>} ctx
@@ -5546,8 +5552,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, verdict)) {
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
-      // The hop cap or a mid-request key revocation ends the continuation with
-      // its own non-unified 429 rather than the seat's spent answer (AI-1903).
+      // A mid-request key revocation, or the hop cap under force, ends the
+      // continuation with its own non-unified 429 rather than the seat's spent
+      // answer (AI-1903); recommend at the cap gets the seat's answer below.
       if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pick made from the conversation's pin inside the seat keeps the
       // pinned account's verdict as the answer (boundPinned): re-selecting
@@ -5946,8 +5953,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
-      // The hop cap or a mid-request key revocation (AI-1903) gets its own
-      // non-unified 429, never the seat's spent answer.
+      // A mid-request key revocation, or the hop cap under force (AI-1903),
+      // gets its own non-unified 429, never the seat's spent answer.
       if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pin inside the seat keeps the hard stop (with the queue hint) rather
       // than re-selecting onto a sibling — same rule as the pre-send verdict.

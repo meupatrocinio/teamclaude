@@ -752,12 +752,14 @@ test('(l) a two-account seat whose accounts are all spent answers the seat\'s 42
     }
     assert.deepEqual(seen.map(s => s.who), ['sa', 'sb'], 'the second answer comes from the recording');
   });
+  // AI-2049: the pinned sa continues on sb inside the first request; sb is
+  // spent too, so both answers are the stop with no sibling left.
   await allSeatAccountsFail(spent('7d', 48 * HOUR), true, (answers, seen) => {
     assert.deepEqual(answers.map(a => a.status), [429, 429]);
-    assert.match(JSON.parse(answers[0].text).error.message, /^You can keep working by moving to another assigned account; "sb" appears available\. The account "sa", pinned to this conversation, cannot serve this request because its quota is exhausted until /);
-    assert.equal(answers[0].headers.get('anthropic-ratelimit-unified-status'), null, 'the continuation offer carries no unified headers');
-    assert.match(JSON.parse(answers[1].text).error.message, /^Your Claude seat "seat-a" is out of quota until \S+Z\. This conversation is pinned to "sb", and no other account on this seat can serve now\. Use `cg kimi on` to keep working meanwhile\.$/);
-    assert.equal(answers[1].headers.get('anthropic-ratelimit-unified-7d-status'), 'rejected');
+    for (const a of answers) {
+      assert.match(JSON.parse(a.text).error.message, /^Your Claude seat "seat-a" is out of quota until \S+Z\. This conversation is pinned to "sb", and no other account on this seat can serve now\. Use `cg kimi on` to keep working meanwhile\.$/);
+      assert.equal(a.headers.get('anthropic-ratelimit-unified-7d-status'), 'rejected');
+    }
     assert.deepEqual(seen.map(s => s.who), ['sa', 'sb']);
   });
 });

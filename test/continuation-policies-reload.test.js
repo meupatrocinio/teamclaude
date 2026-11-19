@@ -46,12 +46,16 @@ async function withServer(fn) {
         { name: 'a@example.com', type: 'apikey', apiKey: 'k1' },
         { name: 'b@example.com', type: 'apikey', apiKey: 'k2' },
         { name: 'c@example.com', type: 'apikey', apiKey: 'k3' },
+        { name: 'd@example.com', type: 'apikey', apiKey: 'k4' },
       ],
-      clientRoutes: [{ name: 's1+s2+s3', clients: ['ana'], accounts: ['a@example.com', 'b@example.com', 'c@example.com'] }],
+      clientRoutes: [{ name: 's1+s2+s3+s4', clients: ['ana'], accounts: ['a@example.com', 'b@example.com', 'c@example.com', 'd@example.com'] }],
     }),
   });
   try {
-    await fn({ hits, spentFor, port: logged.port, configPath: logged.configPath });
+    // Both policies hop at the end of an account (AI-2049): the policy that
+    // armed each hop is read from its log line.
+    const hopModes = () => [...logged.output().matchAll(/Seat (force|recommend) continuation/g)].map((m) => m[1]);
+    await fn({ hits, spentFor, port: logged.port, configPath: logged.configPath, hopModes });
   } finally {
     await logged.stop();
     stub.close();
@@ -85,7 +89,7 @@ const status = async (port, key = 'admin-key') => {
 };
 
 test('boot without the field is legacy; reload adds, changes and fail-safes roots without a restart', async () => {
-  await withServer(async ({ hits, spentFor, port, configPath }) => {
+  await withServer(async ({ hits, spentFor, port, configPath, hopModes }) => {
     // Boot without continuationPolicies: legacy header behavior, byte-identical.
     assert.equal((await send(port, { session: 'a', text: 'one' })).status, 200);
     spentFor.add('k1');
@@ -105,10 +109,10 @@ test('boot without the field is legacy; reload adds, changes and fail-safes root
     await reload(port);
     assert.equal((await send(port, { session: 'b', text: 'two' })).status, 200, 'fresh conversation: the queue head servable account');
     spentFor.add('k2');
-    const stopped = await send(port, { session: 'b', text: 'two', policy: '*=force' });
-    assert.equal(stopped.status, 429, 'the recommend root ignores the legacy force header');
-    assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
-    assert.deepEqual(hits, ['k1', 'k1', 'k2', 'k2', 'k2'], 'no hop under the recommend root');
+    const continued = await send(port, { session: 'b', text: 'two', policy: '*=force' });
+    assert.equal(continued.status, 200);
+    assert.deepEqual(hits, ['k1', 'k1', 'k2', 'k2', 'k2', 'k3']);
+    assert.deepEqual(hopModes(), ['force', 'recommend'], 'the recommend root ignores the legacy force header');
     let admin = await status(port);
     assert.deepEqual(admin.continuationPolicies, [{ client: 'ana', mode: 'recommend', revision: 'r_reload1', quarantine: false }]);
     let ana = await status(port, 'ana-key');
@@ -120,21 +124,24 @@ test('boot without the field is legacy; reload adds, changes and fail-safes root
     disk.continuationPolicies = [{ client: 'ana', keyHash: keyHash('ana-key'), mode: 'force', revision: 'r_reload2', quarantine: false }];
     await writeFile(configPath, JSON.stringify(disk));
     await reload(port);
+    spentFor.add('k3');
     const forcedAgain = await send(port, { session: 'b', text: 'two', policy: '*=recommend' });
-    assert.equal(forcedAgain.status, 200, 'the force root hops despite the legacy recommend header');
-    assert.deepEqual(hits.at(-1), 'k3');
+    assert.equal(forcedAgain.status, 200);
+    assert.deepEqual(hits.at(-1), 'k4');
+    assert.deepEqual(hopModes(), ['force', 'recommend', 'force'], 'the force root hops despite the legacy recommend header');
     admin = await status(port);
     assert.deepEqual(admin.continuationPolicies, [{ client: 'ana', mode: 'force', revision: 'r_reload2', quarantine: false }]);
 
     // A malformed reload fails safe to recommend and says so in status.
-    spentFor.add('k3');
+    spentFor.add('k4');
     disk.continuationPolicies = 'oops';
     await writeFile(configPath, JSON.stringify(disk));
     await reload(port);
     const safe = await send(port, { session: 'b', text: 'two', policy: '*=force' });
     assert.equal(safe.status, 429, 'fail-safe recommend: no hop under a malformed list');
     assert.match(safe.json?.error?.message ?? '', /no other account on this seat can serve now/);
-    assert.deepEqual(hits.filter((h) => h === 'k3').length, 2, 'no second k3 attempt: the legacy force header was ignored');
+    assert.deepEqual(hits.filter((h) => h === 'k4').length, 2, 'no second k4 attempt');
+    assert.deepEqual(hopModes(), ['force', 'recommend', 'force'], 'no hop: every other account is spent');
     admin = await status(port);
     assert.equal(admin.continuationPolicyLoadError, 'malformed_list');
     assert.deepEqual(admin.continuationPolicies, []);

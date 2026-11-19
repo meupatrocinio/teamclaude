@@ -1,7 +1,8 @@
 // Durable continuation-attempt telemetry (AI-1959, phase 3 of AI-1902).
 //
 // One JSONL event per continuation-selected sibling upstream send — a force
-// hop (AI-1903) or a taken recommend offer — written (open/write/fsync/close)
+// or recommend hop (AI-1903, AI-2049; `mode` is the policy in effect) or a
+// taken recommend offer — written (open/write/fsync/close)
 // BEFORE the send, so a destination that dies mid-stream still left its
 // trace. The console counts and alerts on these across restarts.
 //

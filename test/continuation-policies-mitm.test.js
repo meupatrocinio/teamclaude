@@ -144,7 +144,12 @@ test('two keys sharing a client name get separate tunnel listeners and separate 
   });
   const upPort = await listen(upstream);
   const quietLog = console.log;
-  console.log = () => {};
+  /** @type {string[]} */
+  const logs = [];
+  console.log = (...a) => { logs.push(a.join(' ')); };
+  // The policy that armed each continuation hop, from its log line (AI-2049:
+  // both policies hop, so the policy shows in the log, not the status).
+  const hopModes = () => logs.map((l) => /Seat (force|recommend) continuation/.exec(l)?.[1]).filter(Boolean);
   // ana has two keys; only ana-key has a root. ana-alt stays legacy.
   const am = new AccountManager([oauth('sa'), oauth('sc')], 0.98, {
     clientRoutes: [{ name: 's1+s2', clients: ['ana'], accounts: ['sa', 'sc'] }],
@@ -189,14 +194,16 @@ test('two keys sharing a client name get separate tunnel listeners and separate 
     assert.equal(await viaTunnel('alt-1', 'ana-alt-key'), 200);
     assert.deepEqual(seen, ['sa', 'sa']);
     state.spent = true;
-    // The alt key is legacy: a recommend header does not hop.
-    assert.equal(await viaTunnel('alt-1', 'ana-alt-key', '*=recommend'), 429, 'the rootless key keeps legacy behavior');
-    assert.deepEqual(seen, ['sa', 'sa', 'sa']);
+    // The alt key is legacy: its recommend header governs its hop.
+    assert.equal(await viaTunnel('alt-1', 'ana-alt-key', '*=recommend'), 200, 'the rootless key continues under its legacy header');
+    assert.deepEqual(seen, ['sa', 'sa', 'sa', 'sc']);
+    assert.deepEqual(hopModes(), ['recommend'], 'the rootless key keeps legacy behavior');
     // The rooted key force-hops on the same seat, with no header at all. sa's
     // rejection is already recorded (the alt key's 429), so the hop is armed
     // pre-send and sa is not touched again.
     assert.equal(await viaTunnel('root-1', 'ana-key'), 200, 'the root must force the hop');
-    assert.deepEqual(seen, ['sa', 'sa', 'sa', 'sc']);
+    assert.deepEqual(seen, ['sa', 'sa', 'sa', 'sc', 'sc']);
+    assert.deepEqual(hopModes(), ['recommend', 'force'], 'the root must force the hop');
   } finally {
     console.log = quietLog;
     closeHard(mitm);

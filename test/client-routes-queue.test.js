@@ -7,12 +7,12 @@ import { recordSeatRejection, seatVerdict } from '../src/client-routes.js';
 
 // The seat queue (IPM fork): a multi-account seat is a queue of accounts,
 // most free space first while handoffBeforeSwitch is on (equal room, e.g. no
-// readings yet, keeps config order), config order when it is off. The first
-// quota failure on a pinned conversation offers the choices
-// (continue cold, start a new conversation, or wait for the reset) and
-// discloses the cold-cache continuation; the next prompt in that same
-// conversation confirms it and moves once. A fresh conversation still advances
-// without that ceremony.
+// readings yet, keeps config order), config order when it is off. A pinned
+// conversation whose account runs out continues on the next account in the
+// same request, cold, under both policies (AI-2049). When a recommend
+// continuation is refused by the per-request hop cap, the answer is the offer:
+// the choices (continue cold, start a new conversation, or wait for the reset)
+// and the disclosed cold-cache continuation the next prompt confirms.
 
 const HOUR = 3600_000;
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
@@ -45,7 +45,7 @@ const spent = (res) => {
   res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
 };
 
-async function withGateway({ handler = (_who, res) => ok(res), config: extra = {} } = {}, fn) {
+async function withGateway({ handler = (_who, res) => ok(res), config: extra = {}, names = ['qa', 'qb', 'qc', 'qr'], routes = ROUTES } = {}, fn) {
   const seen = [];
   const attempts = [];
   const upstream = http.createServer(async (req, res) => {
@@ -57,8 +57,8 @@ async function withGateway({ handler = (_who, res) => ok(res), config: extra = {
     handler(who, res);
   });
   const upPort = await listen(upstream);
-  const am = new AccountManager([oauth('qa'), oauth('qb'), oauth('qc'), oauth('qr')], 0.98, {
-    clientRoutes: ROUTES,
+  const am = new AccountManager(names.map(oauth), 0.98, {
+    clientRoutes: routes,
     distributeSessions: true,
     refreshFn: async () => { throw new Error('no refresh'); },
   });
@@ -93,7 +93,7 @@ async function withGateway({ handler = (_who, res) => ok(res), config: extra = {
     return { status: res.status, headers: res.headers, raw, json };
   };
   try {
-    await fn({ send, seen, attempts, am });
+    await fn({ send, seen, attempts, am, config });
   } finally {
     proxy.closeAllConnections?.(); proxy.close();
     upstream.closeAllConnections?.(); upstream.close();
@@ -119,31 +119,33 @@ test('with no readings, fresh conversations keep the queue head: equal room keep
   });
 });
 
-test('a spent pin offers the choices first; the next same-conversation prompt continues cold on the sibling', async () => {
+const offerRecords = (am) => [...am.sessionTracker.sessions.values()].flatMap((s) => [...s.seatContinuations.values()]);
+
+// The hop cap (8 per request, AI-1903) is what refuses a recommend
+// continuation now (AI-2049). A ten-account route whose first nine accounts
+// are spent reaches it on c8 with c9 still servable, so the answer is the
+// offer. The slugs match the accounts so a legacy force header applies.
+const CAP_NAMES = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+const capGateway = (isOn) => ({
+  names: CAP_NAMES,
+  routes: [{ name: CAP_NAMES.map((_, i) => `s${i + 1}`).join('+'), clients: ['amy', 'carol'], accounts: CAP_NAMES }],
+  handler: (who, res) => (isOn() && who !== 'c9' ? spent(res) : ok(res)),
+});
+
+test('a recommend pin that runs out continues cold on the sibling in the same request, with the identical body', async () => {
   let qaSpent = false;
-  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
+  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, attempts, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
     assert.deepEqual(seen, ['qa']);
 
     qaSpent = true;
-    const stopped = await send({ text: 'hello' });
-    assert.equal(stopped.status, 429);
-    assert.equal(stopped.json?.error?.type, 'rate_limit_error');
-    const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
-    assert.ok(!msg.includes('/ipm:handoff'), `a handoff after the limit would confirm the continuation: ${msg}`);
-    assert.ok(msg.includes('start a new conversation'), `the fresh-conversation choice is missing: ${msg}`);
-    assert.ok(msg.includes('wait for "qa" to reset at '), `the reset choice is missing: ${msg}`);
-    assert.ok(msg.includes('reprocess the full conversation at full input-token cost'), `the cold-cache cost is not disclosed: ${msg}`);
-    assert.ok(msg.includes('next prompt confirms'), `the continuation is not disclosed: ${msg}`);
-    assert.equal(stopped.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'the offer must not become the generic plan-limit banner');
-    assert.deepEqual(seen, ['qa', 'qa'], `the first failure leaked to the sibling: ${JSON.stringify(seen)}`);
-
     const continued = await send({ text: 'hello' });
     assert.equal(continued.status, 200);
     assert.equal(continued.raw, okBody, 'the successful assistant body is unchanged');
     assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
-    assert.deepEqual(seen, ['qa', 'qa', 'qb'], `the disclosed continuation did not reach qb: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+    assert.equal(attempts[1].body, attempts[2].body, 'the continuation changed the conversation body');
+    assert.equal(offerRecords(am).length, 0, 'no offer is recorded when the continuation runs');
 
     assert.equal((await send({ text: 'hello' })).status, 200);
     assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qb'], 'the conversation did not stay on its new pin');
@@ -154,7 +156,40 @@ test('a spent pin offers the choices first; the next same-conversation prompt co
   });
 });
 
-test('a continuation offer requires the next account to serve the advisor model too', async () => {
+test('a recommend continuation refused by the hop cap offers the choices; the next prompt takes it', async () => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    assert.deepEqual(seen, ['c0']);
+
+    on = true;
+    const stopped = await send({ text: 'hello' });
+    assert.equal(stopped.status, 429);
+    assert.equal(stopped.json?.error?.type, 'rate_limit_error');
+    const msg = stopped.json?.error?.message ?? '';
+    assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "c9" appears available. The account "c8", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
+    assert.ok(!msg.includes('/ipm:handoff'), `a handoff after the limit would confirm the continuation: ${msg}`);
+    assert.ok(msg.includes('start a new conversation'), `the fresh-conversation choice is missing: ${msg}`);
+    assert.ok(msg.includes('wait for "c8" to reset at '), `the reset choice is missing: ${msg}`);
+    assert.ok(msg.includes('reprocess the full conversation at full input-token cost'), `the cold-cache cost is not disclosed: ${msg}`);
+    assert.ok(msg.includes('next prompt confirms'), `the continuation is not disclosed: ${msg}`);
+    assert.equal(stopped.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'the offer must not become the generic plan-limit banner');
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8'], `the cap did not stop at 8 hops: ${JSON.stringify(seen)}`);
+    assert.equal(offerRecords(am).length, 1);
+
+    const continued = await send({ text: 'hello' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.raw, okBody, 'the successful assistant body is unchanged');
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.equal(offerRecords(am).length, 0, 'the next prompt took the offer');
+    assert.deepEqual(seen.slice(10), ['c9'], `the disclosed continuation did not reach c9: ${JSON.stringify(seen)}`);
+
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    assert.deepEqual(seen.slice(10), ['c9', 'c9'], 'the conversation did not stay on its new pin');
+  });
+});
+
+test('a continuation requires the next account to serve the advisor model too', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, am }) => {
     Object.assign(am.accounts[1].quota, {
@@ -170,61 +205,67 @@ test('a continuation offer requires the next account to serve the advisor model 
     assert.equal(am.unavailableReason(am.accounts[1], 'claude-opus-4-1', 'claude-fable-5'), 'advisor-quota');
     assert.equal((await send({ text: 'hello' })).status, 200);
     qaSpent = true;
-    const stopped = await send({ text: 'hello', advisor: 'claude-fable-5' });
-    assert.equal(stopped.status, 429);
-    const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.includes('currently "qc"'), `the advisor-ineligible qb was offered: ${msg}`);
-    assert.ok(!msg.includes('currently "qb"'), msg);
+    const continued = await send({ text: 'hello', advisor: 'claude-fable-5' });
+    assert.equal(continued.status, 200);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true', 'the advisor-ineligible qb was chosen');
   });
 });
 
-test('a recorded rejection offers the choices before the next prompt switches', async () => {
+test('a recorded rejection moves another conversation pre-send, without sending it to the spent account', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
     assert.equal((await send({ text: 'first' })).status, 200);
     assert.equal((await send({ text: 'second' })).status, 200);
     qaSpent = true;
-    assert.equal((await send({ text: 'second' })).status, 429, 'the second conversation records the rejection upstream');
-    assert.deepEqual(seen, ['qa', 'qa', 'qa']);
-
-    const stopped = await send({ text: 'first' });
-    assert.equal(stopped.status, 429, 'the first conversation gets its own pre-send offer');
-    assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
-    assert.deepEqual(seen, ['qa', 'qa', 'qa'], 'the recorded rejection went upstream again');
-    assert.equal((await send({ text: 'first' })).status, 200);
+    assert.equal((await send({ text: 'second' })).status, 200, 'the second conversation records the rejection upstream and continues');
     assert.deepEqual(seen, ['qa', 'qa', 'qa', 'qb']);
+
+    const moved = await send({ text: 'first' });
+    assert.equal(moved.status, 200, 'the first conversation continues on its own pre-send');
+    assert.equal(moved.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
+    assert.deepEqual(seen, ['qa', 'qa', 'qa', 'qb', 'qb'], 'the recorded rejection went upstream again');
   });
 });
 
-test('a quota failure on the continuation destination needs another confirmation before the third account', async () => {
+test('a quota failure on the recommend destination continues on the third account in the same request', async () => {
   let qaSpent = false;
   let qbSpent = false;
   await withGateway({ handler: (who, res) => ((who === 'qa' && qaSpent) || (who === 'qb' && qbSpent) ? spent(res) : ok(res)) }, async ({ send, seen }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
     qaSpent = true;
-    assert.equal((await send({ text: 'hello' })).status, 429);
     qbSpent = true;
-    const second = await send({ text: 'hello' });
-    assert.equal(second.status, 429);
-    assert.match(second.json?.error?.message ?? '', /account "qb", pinned to this conversation/);
-    assert.match(second.json?.error?.message ?? '', /currently "qc"/);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'the second quota failure walked silently to qc');
-    assert.equal((await send({ text: 'hello' })).status, 200);
+    const walked = await send({ text: 'hello' });
+    assert.equal(walked.status, 200);
+    assert.equal(walked.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true');
     assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qc']);
+    assert.equal((await send({ text: 'hello' })).status, 200);
+    assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qc', 'qc'], 'the conversation did not stay on qc');
   });
 });
 
-test('another client with the same session and opening cannot consume the continuation', async () => {
-  let qaSpent = false;
-  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
+test('another client with the same session and opening cannot consume the continuation offer', async () => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    assert.equal((await send({ text: 'hello' })).status, 429);
-    const other = await send({ key: KEYS.carol, text: 'hello' });
-    assert.equal(other.status, 429, 'the other client gets its own offer, not amy\'s continuation');
-    assert.deepEqual(seen, ['qa', 'qa']);
+    on = true;
+    assert.equal((await send({ text: 'hello' })).status, 429, 'the capped continuation records amy\'s offer');
+    assert.equal(offerRecords(am).length, 1);
+    const quiet = console.log;
+    const logs = [];
+    console.log = (...a) => { logs.push(a.join(' ')); };
+    let other;
+    try {
+      other = await send({ key: KEYS.carol, text: 'hello' });
+    } finally {
+      console.log = quiet;
+    }
+    assert.equal(other.status, 200, 'the other client continues on its own');
+    assert.equal(other.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.ok(logs.some((l) => /Seat recommend continuation .*"c8" → "c9"/.test(l)), 'carol moved by her own policy hop, not by amy\'s offer');
+    assert.equal(offerRecords(am).length, 1, 'the other client consumed amy\'s offer');
     assert.equal((await send({ text: 'hello' })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'an unassigned account was used');
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'c9'],
+      'amy capped on c0..c8, carol moved pre-send to c9, then amy is served on the shared pin');
   });
 });
 
@@ -268,18 +309,21 @@ test('force preserves a successful SSE response byte-for-byte', async () => {
 });
 
 test('pre-send force does not consume an older recommend offer', async () => {
-  let qaSpent = false;
-  await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    assert.equal((await send({ text: 'hello' })).status, 429, 'recommend records the offer');
+    on = true;
+    assert.equal((await send({ text: 'hello' })).status, 429, 'the capped recommend continuation records the offer');
+    assert.equal(offerRecords(am).length, 1);
     am.sessionTracker.takeSeatContinuation = () => { throw new Error('force consumed the old offer'); };
-    assert.equal((await send({ text: 'hello', policy: 's1=force' })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+    const forced = await send({ text: 'hello', policy: '*=force' });
+    assert.equal(forced.status, 200);
+    assert.equal(forced.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9']);
   });
 });
 
-test('mixed policies stop at a recommend destination until its own confirmation', async () => {
+test('mixed policies: a recommend destination that runs out continues on its own too', async () => {
   let qaSpent = false;
   let qbSpent = false;
   await withGateway({ handler: (who, res) => ((who === 'qa' && qaSpent) || (who === 'qb' && qbSpent) ? spent(res) : ok(res)) }, async ({ send, seen }) => {
@@ -287,12 +331,9 @@ test('mixed policies stop at a recommend destination until its own confirmation'
     assert.equal((await send({ text: 'hello' })).status, 200);
     qaSpent = true;
     qbSpent = true;
-    const stopped = await send({ text: 'hello', policy });
-    assert.equal(stopped.status, 429);
-    assert.match(stopped.json?.error?.message ?? '', /account "qb", pinned to this conversation/);
-    assert.match(stopped.json?.error?.message ?? '', /currently "qc"/);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'A force leaked past B recommend to C');
-    assert.equal((await send({ text: 'hello', policy })).status, 200);
+    const walked = await send({ text: 'hello', policy });
+    assert.equal(walked.status, 200);
+    assert.equal(walked.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true');
     assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qc']);
   });
 });
@@ -369,17 +410,12 @@ const weekly = (am, byIndex) => {
   for (const [i, u] of Object.entries(byIndex)) Object.assign(am.accounts[Number(i)].quota, { unified7d: u, unified7dReset: Date.now() + 48 * HOUR });
 };
 
-test('the continuation goes to the account with the most free space, and the offer names it', async () => {
+test('the recommend continuation goes to the account with the most free space', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
     weekly(am, { 1: 0.8, 2: 0.1 });
     qaSpent = true;
-    const stopped = await send({ text: 'hello' });
-    assert.equal(stopped.status, 429);
-    const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.includes('"qc" appears available'), msg);
-    assert.ok(msg.includes('currently "qc"'), msg);
     const continued = await send({ text: 'hello' });
     assert.equal(continued.status, 200);
     assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qc;cold-cache=true');
@@ -406,8 +442,6 @@ test('handoffBeforeSwitch off: the continuation keeps config order', async () =>
     assert.equal((await send({ text: 'hello' })).status, 200);
     weekly(am, { 1: 0.8, 2: 0.1 });
     qaSpent = true;
-    const stopped = await send({ text: 'hello' });
-    assert.ok((stopped.json?.error?.message ?? '').includes('"qb" appears available'));
     const continued = await send({ text: 'hello' });
     assert.equal(continued.status, 200);
     assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
@@ -435,16 +469,12 @@ test('seat order: a listed account past a handoff threshold yields to the next l
   });
 });
 
-test('seat order: when the first listed account is spent, the offer names the next listed one and the continuation goes there', async () => {
+test('seat order: when the first listed account is spent, the recommend continuation goes to the next listed one', async () => {
   let qcSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qc' && qcSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
     assert.equal((await send({ order: 's3,s1' })).status, 200);
     weekly(am, { 0: 0.5, 1: 0.1 });
     qcSpent = true;
-    const stopped = await send({ order: 's3,s1' });
-    assert.equal(stopped.status, 429);
-    const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.includes('"qa" appears available'), msg);
     const continued = await send({ order: 's3,s1' });
     assert.equal(continued.status, 200);
     assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qa;cold-cache=true');
@@ -499,12 +529,9 @@ test('seat order, handoffBeforeSwitch off: the listed accounts first, then confi
     weekly(am, { 0: 0.1, 1: 0.95 });
     assert.equal((await send({ order: 's3,s2' })).status, 200);
     qcSpent = true;
-    const stopped = await send({ order: 's3,s2' });
-    const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.includes('"qb" appears available'), `qb is listed next; config order would name qa: ${msg}`);
     const continued = await send({ order: 's3,s2' });
     assert.equal(continued.status, 200);
-    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qb;cold-cache=true');
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qc;to=qb;cold-cache=true', 'qb is listed next; config order would pick qa');
     assert.deepEqual(seen, ['qc', 'qc', 'qb']);
   });
 });
