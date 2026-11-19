@@ -490,7 +490,7 @@ test('a tool_result turn is forwarded; the next typed prompt is asked', async ()
   });
 });
 
-test('a spent pinned account gets the post-limit offer, not the ask', async () => {
+test('a spent pinned account continues on a sibling in the same request, not the ask', async () => {
   await withGateway({}, async ({ send, seen, am }) => {
     assert.equal((await send()).status, 200);
     recordSeatRejection(am.accounts[0], {
@@ -498,11 +498,12 @@ test('a spent pinned account gets the post-limit offer, not the ask', async () =
       'anthropic-ratelimit-unified-7d-status': 'rejected',
       'anthropic-ratelimit-unified-7d-reset': sec(Date.now() + HOUR),
     }, 'claude-opus-4-1');
-    const offer = await send();
-    assert.equal(offer.status, 429);
-    assert.match(offer.json?.error?.message ?? '', /next prompt confirms/);
-    assert.doesNotMatch(offer.json?.error?.message ?? '', /\/ipm:handoff/);
-    assert.deepEqual(seen, ['qa']);
+    const continued = await send();
+    assert.equal(continued.status, 200);
+    assert.match(continued.headers.get('x-teamclaude-seat-failover') ?? '', /^from=qa;to=q[bc];cold-cache=true$/);
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0], 'qa');
+    assert.notEqual(seen[1], 'qa');
     assert.equal(am.handoffAsks.asked, 0);
   });
 });

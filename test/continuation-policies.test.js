@@ -11,9 +11,12 @@ import {
 // Owner-root continuation policies (IPM fork, AI-1903): the rendered
 // `continuationPolicies` config overrides the legacy per-request
 // x-teamclaude-seat-policy header for every account of the key's route, offers
-// are scoped by root revision and the C9 keyRef, force hops are capped at 8
-// and re-check the key before each one, and the C7 owner-wide paragraph rides
-// the actionable multi-seat 429 only under `x-teamclaude-cg-contract: root-v1`.
+// are scoped by root revision and the C9 keyRef, continuation hops are capped
+// at 8 and re-check the key before each one, and the C7 owner-wide paragraph
+// rides the actionable multi-seat 429 only under `x-teamclaude-cg-contract:
+// root-v1`. Both policies hop at the end of an account (AI-2049): the policy
+// that armed a hop is read from its log line, and the offer is reached by
+// refusing the hop (the key revoked mid-request, restored afterwards).
 
 const HOUR = 3600_000;
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
@@ -100,6 +103,16 @@ async function withGateway({ handler = (_who, _req, res) => ok(res), routes = RO
   }
 }
 
+/** Run fn with console.log captured. @param {(logs: string[]) => Promise<void>} fn */
+async function withLogs(fn) {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(' ')); };
+  try { await fn(logs); } finally { console.log = orig; }
+}
+/** The policy of each continuation hop armed, from its log line. @param {string[]} logs */
+const hopModes = (logs) => logs.map((l) => /Seat (force|recommend) continuation/.exec(l)?.[1]).filter(Boolean);
+
 // ── parsing units ────────────────────────────────────────────────────────────
 
 test('parseContinuationPolicies: absent, malformed, fail-safe entries and error sanitizing', () => {
@@ -179,26 +192,27 @@ test('a recommend root ignores a cached legacy force header', async () => {
   let qaSpent = false;
   const policies = [root('amy', 'amy-key', 'recommend', 'r_two')];
   await withGateway({ policies, handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen }) => {
-    assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    const stopped = await send({ text: 'hello', policy: '*=force' });
-    assert.equal(stopped.status, 429, 'legacy force cannot revive under a recommend root');
-    assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
-    assert.deepEqual(seen, ['qa', 'qa']);
-    assert.equal((await send({ text: 'hello', policy: '*=force' })).status, 200, 'the confirmed continuation still works');
-    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+    await withLogs(async (logs) => {
+      assert.equal((await send({ text: 'hello' })).status, 200);
+      qaSpent = true;
+      const continued = await send({ text: 'hello', policy: '*=force' });
+      assert.equal(continued.status, 200);
+      assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+      assert.deepEqual(hopModes(logs), ['recommend'], 'legacy force cannot revive under a recommend root');
+    });
   });
 });
 
 test('a malformed policy list fails safe to recommend and never revives legacy force', async () => {
   let qaSpent = false;
   await withGateway({ policies: 'oops', handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, control, seen }) => {
-    assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    const stopped = await send({ text: 'hello', policy: '*=force' });
-    assert.equal(stopped.status, 429);
-    assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
-    assert.deepEqual(seen, ['qa', 'qa'], 'no hop may happen under the malformed list');
+    await withLogs(async (logs) => {
+      assert.equal((await send({ text: 'hello' })).status, 200);
+      qaSpent = true;
+      assert.equal((await send({ text: 'hello', policy: '*=force' })).status, 200);
+      assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+      assert.deepEqual(hopModes(logs), ['recommend'], 'the hop under the malformed list is recommend, never force');
+    });
     const status = (await control('/teamclaude/status')).json;
     assert.equal(status.continuationPolicyLoadError, 'malformed_list');
     const amy = (await control('/teamclaude/status', KEYS.amy)).json;
@@ -210,11 +224,13 @@ test('a malformed entry fails its own key safe to recommend (malformed_entries)'
   let qaSpent = false;
   const policies = [{ client: 'amy', keyHash: keyHashOf('amy-key'), mode: 'Force', revision: 'r_bad' }];
   await withGateway({ policies, handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, control, seen }) => {
-    assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    const stopped = await send({ text: 'hello', policy: '*=force' });
-    assert.equal(stopped.status, 429, 'no force under a malformed entry');
-    assert.deepEqual(seen, ['qa', 'qa']);
+    await withLogs(async (logs) => {
+      assert.equal((await send({ text: 'hello' })).status, 200);
+      qaSpent = true;
+      assert.equal((await send({ text: 'hello', policy: '*=force' })).status, 200);
+      assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+      assert.deepEqual(hopModes(logs), ['recommend'], 'no force under a malformed entry');
+    });
     assert.equal((await control('/teamclaude/status')).json.continuationPolicyLoadError, 'malformed_entries');
   });
 });
@@ -265,6 +281,32 @@ test('the 8-hop cap and per-hop key re-check also bind a rootless legacy force r
   });
 });
 
+test('a recommend continuation is capped at 8 hops too, then answers as before AI-2049: the offer', async () => {
+  const names = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+  const routes = [{ name: 'ten', clients: ['amy'], accounts: names }];
+  let allSpent = false;
+  const policies = [root('amy', 'amy-key', 'recommend', 'r_cap')];
+  await withGateway({
+    routes,
+    accounts: names.map(oauth),
+    policies,
+    handler: (_who, _req, res) => (allSpent ? spent(res) : ok(res)),
+  }, async ({ send, seen, am }) => {
+    assert.equal((await send({ session: 'cap-r', text: 'cap' })).status, 200);
+    allSpent = true;
+    const r = await send({ session: 'cap-r', text: 'cap' });
+    assert.equal(r.status, 429);
+    const msg = r.json?.error?.message ?? '';
+    assert.doesNotMatch(msg, /automatic continuations/, 'the force cap answer is not the recommend one');
+    assert.match(msg, /account "c8", pinned to this conversation/, msg);
+    assert.match(msg, /"c9" appears available/, msg);
+    assert.match(msg, /next prompt confirms/, msg);
+    assert.equal(seen.length, 10, `1 initial + 1 first turn + 8 hops: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen.slice(1), names.slice(0, 9), 'c9 was never attempted');
+    assert.equal(offerRecords(am).length, 1, 'the refused continuation records the offer');
+  });
+});
+
 test('a key revoked mid-request stops admitted force hops with a non-unified 429 (E11)', async () => {
   let qaSpent = false;
   let revoke = null;
@@ -303,57 +345,72 @@ test('a key revoked mid-request stops admitted force hops with a non-unified 429
 
 const offerRecords = (am) => [...am.sessionTracker.sessions.values()].flatMap((s) => [...s.seatContinuations.values()]);
 
+/**
+ * A handler whose spent answer for qa also revokes every client key, once,
+ * refusing that request's continuation (E11) so it answers with the offer.
+ * @param {() => boolean} isSpent
+ * @param {{ revoke: null|(() => void) }} hook
+ */
+const revokingHandler = (isSpent, hook) => (who, _req, res) => {
+  if (who === 'qa' && isSpent()) {
+    const r = hook.revoke;
+    hook.revoke = null;
+    r?.();
+    spent(res);
+    return;
+  }
+  ok(res);
+};
+
 test('an offer recorded under R1 cannot authorize a continuation under R2; it is consumed and fails closed', async () => {
   let qaSpent = false;
+  const hook = { revoke: null };
   const policies = [root('amy', 'amy-key', 'recommend', 'r_one')];
-  await withGateway({ policies, handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, am }) => {
+  await withGateway({ policies, handler: revokingHandler(() => qaSpent, hook) }, async ({ send, seen, am, config }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
     qaSpent = true;
-    assert.equal((await send({ text: 'hello' })).status, 429, 'the R1 offer is recorded');
+    const orig = config.proxy.clientKeys;
+    hook.revoke = () => { config.proxy.clientKeys = []; };
+    assert.equal((await send({ text: 'hello' })).status, 429, 'the refused continuation records the R1 offer');
+    config.proxy.clientKeys = orig;
     assert.equal(offerRecords(am).length, 1);
     assert.equal(offerRecords(am)[0].revision, 'r_one');
     assert.equal(offerRecords(am)[0].keyRef, offerKeyRef(keyHashOf('amy-key')));
 
-    // A reload changes the root revision: the stale offer fails closed.
+    // A reload changes the root revision: the stale offer fails closed, and
+    // the continuation that follows is the R2 policy's own hop.
     am.setContinuationPolicies([root('amy', 'amy-key', 'recommend', 'r_two')], undefined);
-    const again = await send({ text: 'hello' });
-    assert.equal(again.status, 429, 'the R1 offer cannot authorize the continuation under R2');
-    assert.deepEqual(seen, ['qa', 'qa'], 'the pre-send verdict answered without upstream');
-    assert.equal(offerRecords(am).length, 1, 'the stale offer was consumed and a fresh one recorded');
-    assert.equal(offerRecords(am)[0].revision, 'r_two');
-
-    assert.equal((await send({ text: 'hello' })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+    await withLogs(async (logs) => {
+      const again = await send({ text: 'hello' });
+      assert.equal(again.status, 200);
+      assert.deepEqual(hopModes(logs), ['recommend'], 'the R1 offer did not authorize the continuation; the R2 hop did');
+    });
+    assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'the pre-send verdict moved without sending to qa');
+    assert.equal(offerRecords(am).length, 0, 'the stale offer was consumed');
   });
 });
 
 test('an in-flight request recording after a revision change is a no-op (E13)', async () => {
   let qaSpent = false;
-  let flip = null;
+  const hook = { revoke: null };
   const policies = [root('amy', 'amy-key', 'recommend', 'r_one')];
-  await withGateway({
-    policies,
-    handler: (who, _req, res) => {
-      if (who === 'qa' && qaSpent) {
-        // The reload to R2 lands between this request's admission (which
-        // snapshotted R1) and the answer that would record the offer.
-        flip?.();
-        spent(res);
-        return;
-      }
-      ok(res);
-    },
-  }, async ({ send, seen, am }) => {
+  await withGateway({ policies, handler: revokingHandler(() => qaSpent, hook) }, async ({ send, seen, am, config }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
     qaSpent = true;
-    flip = () => am.setContinuationPolicies([root('amy', 'amy-key', 'recommend', 'r_two')], undefined);
+    const orig = config.proxy.clientKeys;
+    // The reload to R2 lands between this request's admission (which
+    // snapshotted R1) and the answer that would record the offer; the same
+    // reload drops the key, so the continuation is refused.
+    hook.revoke = () => {
+      am.setContinuationPolicies([root('amy', 'amy-key', 'recommend', 'r_two')], undefined);
+      config.proxy.clientKeys = [];
+    };
     const stopped = await send({ text: 'hello' });
+    config.proxy.clientKeys = orig;
     assert.equal(stopped.status, 429, 'the offer is still disclosed');
+    assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
     assert.equal(offerRecords(am).length, 0, 'but the R1-admitted request recorded nothing under R2');
-    assert.equal((await send({ text: 'hello' })).status, 429, 'with no offer the next prompt gets its own disclosure');
-    assert.equal(offerRecords(am).length, 1);
-    assert.equal(offerRecords(am)[0].revision, 'r_two');
-    assert.equal((await send({ text: 'hello' })).status, 200);
+    assert.equal((await send({ text: 'hello' })).status, 200, 'with no offer the next prompt continues under R2 on its own');
     assert.deepEqual(seen, ['qa', 'qa', 'qb']);
   });
 });
@@ -361,27 +418,35 @@ test('an in-flight request recording after a revision change is a no-op (E13)', 
 // ── the C7 paragraph and the contract header (AC6) ───────────────────────────
 
 test('the C7 paragraph rides the actionable multi-seat 429 only with the contract header', async () => {
-  let qaSpent = false;
-  await withGateway({ handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send }) => {
-    // Two conversations, both pinned on qa before it spends out.
-    assert.equal((await send({ text: 'hello', session: 's-plain' })).status, 200);
-    assert.equal((await send({ text: 'hello', session: 's-gated' })).status, 200);
-    assert.equal((await send({ text: 'hello', session: 's-v2' })).status, 200);
-    qaSpent = true;
-    const plain = await send({ text: 'hello', session: 's-plain' });
-    assert.equal(plain.status, 429);
-    assert.ok(!(plain.json?.error?.message ?? '').includes('cg seat-policy force'), 'no header: today\'s text');
+  /** The offer one refused continuation answers, under a given contract header. @param {string|undefined} contract */
+  const offerUnder = async (contract) => {
+    let qaSpent = false;
+    const hook = { revoke: null };
+    let answer = null;
+    await withGateway({ handler: revokingHandler(() => qaSpent, hook) }, async ({ send, config }) => {
+      assert.equal((await send({ text: 'hello' })).status, 200);
+      qaSpent = true;
+      const orig = config.proxy.clientKeys;
+      hook.revoke = () => { config.proxy.clientKeys = []; };
+      answer = await send({ text: 'hello', contract });
+      config.proxy.clientKeys = orig;
+    });
+    assert.equal(answer.status, 429);
+    return answer.json?.error?.message ?? '';
+  };
+  assert.ok(!(await offerUnder(undefined)).includes('cg seat-policy'), 'no header: today\'s text');
 
-    const gated = await send({ text: 'hello', session: 's-gated', contract: 'root-v1' });
-    assert.equal(gated.status, 429);
-    const msg = gated.json?.error?.message ?? '';
-    assert.ok(msg.includes(CG_SEAT_POLICY_ROOT_PARAGRAPH), `the verbatim paragraph is missing: ${msg}`);
-    assert.ok(msg.includes('next prompt confirms'), 'the paragraph extends the existing offer');
+  const msg = await offerUnder('root-v1');
+  assert.ok(msg.includes(CG_SEAT_POLICY_ROOT_PARAGRAPH), `the verbatim paragraph is missing: ${msg}`);
+  assert.ok(msg.includes('next prompt confirms'), 'the paragraph extends the existing offer');
 
-    const other = await send({ text: 'hello', session: 's-v2', contract: 'root-v2' });
-    assert.equal(other.status, 429);
-    assert.ok(!(other.json?.error?.message ?? '').includes('cg seat-policy force'), 'an unknown contract version must not unlock the paragraph');
-  });
+  assert.ok(!(await offerUnder('root-v2')).includes('cg seat-policy'), 'an unknown contract version must not unlock the paragraph');
+});
+
+test('the C7 paragraph says both policies continue on their own and differ only in the handoff suggestion (AI-2049)', () => {
+  assert.match(CG_SEAT_POLICY_ROOT_PARAGRAPH, /Both seat policies continue a conversation automatically/);
+  assert.match(CG_SEAT_POLICY_ROOT_PARAGRAPH, /`cg seat-policy recommend` suggests a handoff first, and `cg seat-policy force` never does/);
+  assert.doesNotMatch(CG_SEAT_POLICY_ROOT_PARAGRAPH, /restore confirmations/);
 });
 
 test('single-seat and no-candidate 429s never carry the C7 paragraph, header or not', async () => {

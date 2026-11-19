@@ -1,12 +1,12 @@
 // handoffBeforeSwitch (IPM fork): recommend `/ipm:handoff` while the account a
 // seat-bound conversation is pinned to can still serve it, not after.
 //
-// On a multi-account seat under the `recommend` policy, a conversation whose
-// pinned account runs out is offered a cold-cache continuation on a sibling
-// (client-routes.js seatAnswer). By then a handoff is too late: running it is a
-// prompt in that same conversation, so it is the prompt that confirms the
-// continuation it was meant to avoid. A handoff only helps while the pinned
-// account still serves, with the conversation in its prompt cache.
+// On a multi-account seat, a conversation whose pinned account runs out
+// continues on a sibling with a cold cache, in the same request, under both
+// policies (AI-2049). By then a handoff is too late: the cold continuation has
+// already happened. A handoff only helps while the pinned account still
+// serves, with the conversation in its prompt cache, and only `recommend`
+// asks for one.
 //
 // So when a large seat-bound conversation's pinned account is past a handoff
 // threshold and another account on the seat could take over, the proxy answers
@@ -291,8 +291,8 @@ export function softDrainIndex(accountManager, candidates, model, advisorModel, 
  *
  * Asked only when the pinned account's policy is `recommend` (force means the
  * owner chose silent continuation; a 429 would stop the workers), the account
- * can still serve (`verdict` null: once it is spent the post-limit offer
- * answers instead), a known window whose reset is still ahead is past its
+ * can still serve (`verdict` null: once it is spent the conversation
+ * continues on a sibling instead), a known window whose reset is still ahead is past its
  * threshold (pastHandoffThreshold), another account on the seat could take over (`sibling`), and
  * the record allows it.
  *

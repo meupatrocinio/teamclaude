@@ -17,8 +17,8 @@ import { createConnectHandler } from '../src/mitm.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 
 // Durable continuation-attempt events (IPM fork, AI-1959 / AI-1902 phase 3):
-// one JSONL line per continuation-selected sibling send — a force hop or a
-// taken recommend offer — written (open/chmod/write/fsync/close) BEFORE the
+// one JSONL line per continuation-selected sibling send — a force or recommend
+// hop, or a taken recommend offer — written (open/chmod/write/fsync/close) BEFORE the
 // send, so the console can count continuations across restarts. Off unless
 // config.continuationAttemptsLog names a path; a failed write never fails the
 // request and flips the admin-only continuationTelemetry status instead.
@@ -468,7 +468,7 @@ test('force hops chain: hop numbers and from/to follow each continuation', async
   }
 });
 
-test('RECOMMEND_TAKEN: a taken offer records one recommend event with hop 1', async () => {
+test('RECOMMEND_HOP: an automatic recommend continuation records one recommend event with hop 1', async () => {
   const dir = tmpdir();
   try {
     const logPath = join(dir, 'attempts.jsonl');
@@ -478,10 +478,51 @@ test('RECOMMEND_TAKEN: a taken offer records one recommend event with hop 1', as
       attemptsLog: logPath,
       policies,
       handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)),
-    }, async ({ send }) => {
+    }, async ({ send, seen }) => {
       assert.equal((await send()).status, 200);
       qaSpent = true;
-      assert.equal((await send()).status, 429, 'the offer is disclosed, nothing sent to a sibling');
+      assert.equal((await send()).status, 200, 'the same request continues on the sibling');
+      assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+      const events = readEvents(logPath);
+      assert.equal(events.length, 1);
+      const ev = events[0];
+      assert.deepEqual(Object.keys(ev), T1_KEYS);
+      assert.equal(ev.mode, 'recommend', 'the policy in effect, no new label');
+      assert.equal(ev.hop, 1);
+      assert.equal(ev.from, 'qa');
+      assert.equal(ev.to, 'qb');
+      assert.equal(ev.source, 'root');
+      assert.equal(ev.revision, 'r_rec');
+      assert.equal(ev.keyRef, offerKeyRef(keyHashOf('amy-key')));
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('RECOMMEND_TAKEN: a taken offer (after a refused continuation) records one recommend event with hop 1', async () => {
+  const dir = tmpdir();
+  try {
+    const logPath = join(dir, 'attempts.jsonl');
+    let qaSpent = false;
+    let revoke = null;
+    const policies = [root('amy', 'amy-key', 'recommend', 'r_rec')];
+    await withGateway({
+      attemptsLog: logPath,
+      policies,
+      handler: (who, _req, res) => {
+        if (who === 'qa' && qaSpent) { revoke?.(); return spent(res); }
+        ok(res);
+      },
+    }, async ({ send, config }) => {
+      assert.equal((await send()).status, 200);
+      qaSpent = true;
+      const orig = config.proxy.clientKeys;
+      revoke = () => { revoke = null; config.proxy.clientKeys = []; };
+      const offered = await send();
+      config.proxy.clientKeys = orig;
+      assert.equal(offered.status, 429, 'the refused continuation discloses the offer, nothing sent to a sibling');
+      assert.match(offered.json?.error?.message ?? '', /next prompt confirms/);
       assert.equal(readEvents(logPath).length, 0, 'the disclosed offer writes no event');
       assert.equal((await send()).status, 200, 'the next prompt confirms and takes the offer');
       const events = readEvents(logPath);
@@ -508,23 +549,20 @@ test('RECOMMEND_THEN_FORCE: a taken recommend hop followed by a force hop number
     let qaSpent = false;
     await withGateway({
       attemptsLog: logPath,
-      // s1 (qa) recommend, s2/s3 (qb/qc) force: the offer lands on qb, qb's
-      // own 429 then force-hops to qc inside the same request.
+      // s1 (qa) recommend, s2/s3 (qb/qc) force: qa's 429 continues on qb,
+      // qb's own 429 then force-hops to qc inside the same request.
       handler: (who, _req, res) => ((who === 'qa' && qaSpent) || who === 'qb' ? spent(res) : ok(res)),
     }, async ({ send, seen }) => {
       const policy = 's1=recommend,s2=force,s3=force';
       assert.equal((await send({ policy })).status, 200);
       qaSpent = true;
-      assert.equal((await send({ policy })).status, 429, 'recommend discloses the offer, nothing sent to a sibling');
-      assert.equal(readEvents(logPath).length, 0);
-      assert.equal((await send({ policy })).status, 200, 'offer taken to qb; qb spent upstream; force hop on to qc');
+      assert.equal((await send({ policy })).status, 200, 'recommend hop to qb; qb spent upstream; force hop on to qc');
       assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qc']);
       const events = readEvents(logPath);
       assert.deepEqual(events.map((e) => [e.mode, e.hop, e.from, e.to]), [
         ['recommend', 1, 'qa', 'qb'],
-        // Arming-time numbering off continuationHops (which the recommend path
-        // never increments) would call this hop 1 too — a (requestId, hop)
-        // collision. Send-time numbering keeps it 2.
+        // Send-time numbering: one count of continuation sends per request,
+        // whichever policy armed each hop, so never 1, 1.
         ['force', 2, 'qb', 'qc'],
       ]);
     });
@@ -562,18 +600,29 @@ test('NO_EVENT: initial 429, no sibling, key revoked mid-request, and a pre-send
   const dir = tmpdir();
   try {
     const logPath = join(dir, 'attempts.jsonl');
-    // (1) recommend root: the initial 429 only records an offer.
+    // (1) recommend root with the key revoked mid-request: the continuation
+    // is refused and the 429 only records an offer.
     let qaSpent = false;
+    let revokeRec = null;
     const recommend = [root('amy', 'amy-key', 'recommend', 'r_rec')];
     await withGateway({
       attemptsLog: logPath,
       policies: recommend,
-      handler: (who, _req, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)),
-    }, async ({ send }) => {
+      handler: (who, _req, res) => {
+        if (who === 'qa' && qaSpent) { revokeRec?.(); return spent(res); }
+        ok(res);
+      },
+    }, async ({ send, config }) => {
       assert.equal((await send()).status, 200);
       qaSpent = true;
-      assert.equal((await send()).status, 429);
-      assert.equal(readEvents(logPath).length, 0, 'the initial 429 and the recorded offer write nothing');
+      const orig = config.proxy.clientKeys;
+      revokeRec = () => { revokeRec = null; config.proxy.clientKeys = []; };
+      try {
+        assert.equal((await send()).status, 429);
+        assert.equal(readEvents(logPath).length, 0, 'the initial 429 and the recorded offer write nothing');
+      } finally {
+        config.proxy.clientKeys = orig;
+      }
     });
 
     // (2) force root on a single-account seat: no sibling to hop to.
