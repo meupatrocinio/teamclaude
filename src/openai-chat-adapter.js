@@ -16,7 +16,8 @@ const REQUEST_FIELDS = new Set([
   'top_p', 'stop_sequences', 'output_config', 'metadata',
   'tools', 'thinking', 'context_management', 'safeguards',
 ]);
-const EFFORTS = new Set(['low', 'medium', 'high']);
+// xhigh exists on some upstream models only; the Antigravity bridge refuses it per model (AI-2050).
+const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
 
 export class OpenAIChatRequestError extends Error {
   /** @param {string} message */
