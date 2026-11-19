@@ -9,8 +9,8 @@ import { recordSeatRejection, seatVerdict } from '../src/client-routes.js';
 // most free space first while handoffBeforeSwitch is on (equal room, e.g. no
 // readings yet, keeps config order), config order when it is off. A pinned
 // conversation whose account runs out continues on the next account in the
-// same request, cold, under both policies (AI-2049). When that continuation is
-// refused (the key stops being current mid-request), the answer is the offer:
+// same request, cold, under both policies (AI-2049). When a recommend
+// continuation is refused by the per-request hop cap, the answer is the offer:
 // the choices (continue cold, start a new conversation, or wait for the reset)
 // and the disclosed cold-cache continuation the next prompt confirms.
 
@@ -45,7 +45,7 @@ const spent = (res) => {
   res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
 };
 
-async function withGateway({ handler = (_who, res) => ok(res), config: extra = {} } = {}, fn) {
+async function withGateway({ handler = (_who, res) => ok(res), config: extra = {}, names = ['qa', 'qb', 'qc', 'qr'], routes = ROUTES } = {}, fn) {
   const seen = [];
   const attempts = [];
   const upstream = http.createServer(async (req, res) => {
@@ -57,8 +57,8 @@ async function withGateway({ handler = (_who, res) => ok(res), config: extra = {
     handler(who, res);
   });
   const upPort = await listen(upstream);
-  const am = new AccountManager([oauth('qa'), oauth('qb'), oauth('qc'), oauth('qr')], 0.98, {
-    clientRoutes: ROUTES,
+  const am = new AccountManager(names.map(oauth), 0.98, {
+    clientRoutes: routes,
     distributeSessions: true,
     refreshFn: async () => { throw new Error('no refresh'); },
   });
@@ -121,6 +121,17 @@ test('with no readings, fresh conversations keep the queue head: equal room keep
 
 const offerRecords = (am) => [...am.sessionTracker.sessions.values()].flatMap((s) => [...s.seatContinuations.values()]);
 
+// The hop cap (8 per request, AI-1903) is what refuses a recommend
+// continuation now (AI-2049). A ten-account route whose first nine accounts
+// are spent reaches it on c8 with c9 still servable, so the answer is the
+// offer. The slugs match the accounts so a legacy force header applies.
+const CAP_NAMES = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+const capGateway = (isOn) => ({
+  names: CAP_NAMES,
+  routes: [{ name: CAP_NAMES.map((_, i) => `s${i + 1}`).join('+'), clients: ['amy', 'carol'], accounts: CAP_NAMES }],
+  handler: (who, res) => (isOn() && who !== 'c9' ? spent(res) : ok(res)),
+});
+
 test('a recommend pin that runs out continues cold on the sibling in the same request, with the identical body', async () => {
   let qaSpent = false;
   await withGateway({ handler: (who, res) => (who === 'qa' && qaSpent ? spent(res) : ok(res)) }, async ({ send, seen, attempts, am }) => {
@@ -145,46 +156,36 @@ test('a recommend pin that runs out continues cold on the sibling in the same re
   });
 });
 
-test('a recommend continuation refused mid-request (key no longer current) offers the choices; the next prompt takes it', async () => {
-  let qaSpent = false;
-  let revoke = null;
-  const handler = (who, res) => {
-    if (who === 'qa' && qaSpent) {
-      revoke?.();
-      spent(res);
-      return;
-    }
-    ok(res);
-  };
-  await withGateway({ handler }, async ({ send, seen, config }) => {
+test('a recommend continuation refused by the hop cap offers the choices; the next prompt takes it', async () => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
-    assert.deepEqual(seen, ['qa']);
+    assert.deepEqual(seen, ['c0']);
 
-    qaSpent = true;
-    const orig = config.proxy.clientKeys;
-    revoke = () => { revoke = null; config.proxy.clientKeys = []; };
+    on = true;
     const stopped = await send({ text: 'hello' });
-    config.proxy.clientKeys = orig;
     assert.equal(stopped.status, 429);
     assert.equal(stopped.json?.error?.type, 'rate_limit_error');
     const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
+    assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "c9" appears available. The account "c8", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
     assert.ok(!msg.includes('/ipm:handoff'), `a handoff after the limit would confirm the continuation: ${msg}`);
     assert.ok(msg.includes('start a new conversation'), `the fresh-conversation choice is missing: ${msg}`);
-    assert.ok(msg.includes('wait for "qa" to reset at '), `the reset choice is missing: ${msg}`);
+    assert.ok(msg.includes('wait for "c8" to reset at '), `the reset choice is missing: ${msg}`);
     assert.ok(msg.includes('reprocess the full conversation at full input-token cost'), `the cold-cache cost is not disclosed: ${msg}`);
     assert.ok(msg.includes('next prompt confirms'), `the continuation is not disclosed: ${msg}`);
     assert.equal(stopped.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'the offer must not become the generic plan-limit banner');
-    assert.deepEqual(seen, ['qa', 'qa'], `a refused continuation leaked to the sibling: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8'], `the cap did not stop at 8 hops: ${JSON.stringify(seen)}`);
+    assert.equal(offerRecords(am).length, 1);
 
     const continued = await send({ text: 'hello' });
     assert.equal(continued.status, 200);
     assert.equal(continued.raw, okBody, 'the successful assistant body is unchanged');
-    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=qa;to=qb;cold-cache=true');
-    assert.deepEqual(seen, ['qa', 'qa', 'qb'], `the disclosed continuation did not reach qb: ${JSON.stringify(seen)}`);
+    assert.equal(continued.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.equal(offerRecords(am).length, 0, 'the next prompt took the offer');
+    assert.deepEqual(seen.slice(10), ['c9'], `the disclosed continuation did not reach c9: ${JSON.stringify(seen)}`);
 
     assert.equal((await send({ text: 'hello' })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb', 'qb'], 'the conversation did not stay on its new pin');
+    assert.deepEqual(seen.slice(10), ['c9', 'c9'], 'the conversation did not stay on its new pin');
   });
 });
 
@@ -243,25 +244,28 @@ test('a quota failure on the recommend destination continues on the third accoun
 });
 
 test('another client with the same session and opening cannot consume the continuation offer', async () => {
-  let qaSpent = false;
-  let revoke = null;
-  const handler = (who, res) => {
-    if (who === 'qa' && qaSpent) { revoke?.(); spent(res); return; }
-    ok(res);
-  };
-  await withGateway({ handler }, async ({ send, seen, am, config }) => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    const orig = config.proxy.clientKeys;
-    revoke = () => { revoke = null; config.proxy.clientKeys = []; };
-    assert.equal((await send({ text: 'hello' })).status, 429, 'the refused continuation records amy\'s offer');
-    config.proxy.clientKeys = orig;
+    on = true;
+    assert.equal((await send({ text: 'hello' })).status, 429, 'the capped continuation records amy\'s offer');
     assert.equal(offerRecords(am).length, 1);
-    const other = await send({ key: KEYS.carol, text: 'hello' });
+    const quiet = console.log;
+    const logs = [];
+    console.log = (...a) => { logs.push(a.join(' ')); };
+    let other;
+    try {
+      other = await send({ key: KEYS.carol, text: 'hello' });
+    } finally {
+      console.log = quiet;
+    }
     assert.equal(other.status, 200, 'the other client continues on its own');
+    assert.equal(other.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.ok(logs.some((l) => /Seat recommend continuation .*"c8" → "c9"/.test(l)), 'carol moved by her own policy hop, not by amy\'s offer');
     assert.equal(offerRecords(am).length, 1, 'the other client consumed amy\'s offer');
     assert.equal((await send({ text: 'hello' })).status, 200);
-    assert.ok(seen.every((who) => ['qa', 'qb', 'qc'].includes(who)), `an unassigned account was used: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'c9'],
+      'amy capped on c0..c8, carol moved pre-send to c9, then amy is served on the shared pin');
   });
 });
 
@@ -305,22 +309,17 @@ test('force preserves a successful SSE response byte-for-byte', async () => {
 });
 
 test('pre-send force does not consume an older recommend offer', async () => {
-  let qaSpent = false;
-  let revoke = null;
-  const handler = (who, res) => {
-    if (who === 'qa' && qaSpent) { revoke?.(); spent(res); return; }
-    ok(res);
-  };
-  await withGateway({ handler }, async ({ send, seen, am, config }) => {
+  let on = false;
+  await withGateway(capGateway(() => on), async ({ send, seen, am }) => {
     assert.equal((await send({ text: 'hello' })).status, 200);
-    qaSpent = true;
-    const orig = config.proxy.clientKeys;
-    revoke = () => { revoke = null; config.proxy.clientKeys = []; };
-    assert.equal((await send({ text: 'hello' })).status, 429, 'the refused recommend continuation records the offer');
-    config.proxy.clientKeys = orig;
+    on = true;
+    assert.equal((await send({ text: 'hello' })).status, 429, 'the capped recommend continuation records the offer');
+    assert.equal(offerRecords(am).length, 1);
     am.sessionTracker.takeSeatContinuation = () => { throw new Error('force consumed the old offer'); };
-    assert.equal((await send({ text: 'hello', policy: 's1=force' })).status, 200);
-    assert.deepEqual(seen, ['qa', 'qa', 'qb']);
+    const forced = await send({ text: 'hello', policy: '*=force' });
+    assert.equal(forced.status, 200);
+    assert.equal(forced.headers.get('x-teamclaude-seat-failover'), 'from=c8;to=c9;cold-cache=true');
+    assert.deepEqual(seen, ['c0', 'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9']);
   });
 });
 

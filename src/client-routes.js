@@ -582,7 +582,7 @@ const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
  * `x-teamclaude-cg-contract: root-v1` (E7): an older cg answers
  * `cg seat-policy force` on a multi-seat key with a usage error.
  */
-export const CG_SEAT_POLICY_ROOT_PARAGRAPH = 'Both seat policies continue a conversation automatically on the next assigned account once its pinned account runs out; they differ only before that: `cg seat-policy recommend` suggests a handoff first, and `cg seat-policy force` never does. Either one is a durable owner-wide policy for all local and remote workers using this key and takes effect on the next request.';
+export const CG_SEAT_POLICY_ROOT_PARAGRAPH = 'The automatic continuations for this request reached their limit. Under either seat policy a conversation continues on its own on the next assigned account while one can serve and the limit allows; `cg seat-policy recommend` also suggests a handoff before the pinned account runs out, and `cg seat-policy force` never does. Either one is a durable owner-wide policy for all local and remote workers using this key and takes effect on the next request.';
 
 /**
  * The next account in a seat's queue that can serve now, in the order of
@@ -654,7 +654,7 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null,
       const rej = verdict?.kind === 'spent' ? verdict.rejection : null;
       const when = rej ? new Date(rej.resetsAt).toISOString() : null;
       // A conversation pinned inside a multi-account seat whose automatic
-      // continuation was refused (hop cap, key no longer current) is told the
+      // continuation was refused by the hop cap (recommend) is told the
       // queue: the next account would serve, at one full-price cold-cache turn. No
       // handoff is recommended here: running one is a prompt in this
       // conversation, so it would confirm the continuation it meant to avoid.

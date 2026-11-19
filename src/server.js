@@ -4764,7 +4764,7 @@ function seatPolicyFor(ctx, accountIndex) {
  * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
  * When the request was pinned to one account of a multi-account seat
  * (ctx.boundPinned), that account is spent and its recommend continuation was
- * refused (hopForcedSeat: hop cap, key no longer current), the answer names
+ * refused by the hop cap (hopForcedSeat), the answer names
  * the next servable account in the seat's queue and the choices: continue this
  * conversation there with a cold cache, start a new conversation, or wait for
  * the pinned account to reset.
@@ -4834,8 +4834,9 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
  * - arch plan 9: at most MAX_CONTINUATION_HOPS armed hops per admitted request
  *   (each armed hop is exactly one continuation upstream attempt), then the
  *   request ends (ctx.continuationStopped = 'cap').
- * A refused recommend hop sets no ctx.continuationStopped: it keeps the
- * recommend answer it had before AI-2049 (respondSeat, offer or stop).
+ * A revoked key stops either policy. A recommend hop refused by the cap sets
+ * no ctx.continuationStopped: it gets the recommend answer it had before
+ * AI-2049 (respondSeat, the offer).
  *
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
@@ -4847,7 +4848,7 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
   if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null || verdict.kind !== 'spent') return false;
   const mode = seatPolicyFor(ctx, account.index);
   if (ctx.keyHash && !clientKeyStillCurrent(ctx.proxyConfig, ctx.client, ctx.keyHash)) {
-    if (mode === 'force') ctx.continuationStopped = 'key-revoked';
+    ctx.continuationStopped = 'key-revoked';
     return false;
   }
   if ((ctx.continuationHops ?? 0) >= MAX_CONTINUATION_HOPS) {
@@ -4904,9 +4905,9 @@ function clientKeyStillCurrent(proxyConfig, client, keyHash) {
 }
 
 /**
- * The non-unified 429 a force continuation ends with when the per-request hop
- * cap is reached or the key was revoked mid-request (AI-1903, arch plan 9 /
- * E11). No unified headers (it is not an upstream window verdict), no C7
+ * The non-unified 429 a continuation ends with when the key was revoked
+ * mid-request (either policy), or when a force continuation reaches the
+ * per-request hop cap (AI-1903, arch plan 9 / E11). No unified headers (it is not an upstream window verdict), no C7
  * paragraph, and `x-should-retry: false` so the client stops.
  * @param {any} res
  * @param {Record<string, any>} ctx
@@ -5551,9 +5552,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, verdict)) {
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
-      // Under force, the hop cap or a mid-request key revocation ends the
+      // A mid-request key revocation, or the hop cap under force, ends the
       // continuation with its own non-unified 429 rather than the seat's spent
-      // answer (AI-1903); a refused recommend hop gets the seat's answer below.
+      // answer (AI-1903); recommend at the cap gets the seat's answer below.
       if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pick made from the conversation's pin inside the seat keeps the
       // pinned account's verdict as the answer (boundPinned): re-selecting
@@ -5952,7 +5953,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
-      // Under force, the hop cap or a mid-request key revocation (AI-1903)
+      // A mid-request key revocation, or the hop cap under force (AI-1903),
       // gets its own non-unified 429, never the seat's spent answer.
       if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pin inside the seat keeps the hard stop (with the queue hint) rather

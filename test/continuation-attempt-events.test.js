@@ -500,39 +500,40 @@ test('RECOMMEND_HOP: an automatic recommend continuation records one recommend e
   }
 });
 
-test('RECOMMEND_TAKEN: a taken offer (after a refused continuation) records one recommend event with hop 1', async () => {
+test('RECOMMEND_TAKEN: a taken offer (after the hop cap) records one recommend event with hop 1', async () => {
   const dir = tmpdir();
   try {
     const logPath = join(dir, 'attempts.jsonl');
-    let qaSpent = false;
-    let revoke = null;
+    // The hop cap is what refuses a recommend continuation (AI-2049): nine
+    // spent accounts take the request to it on c8, with c9 still servable.
+    const names = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+    let allSpent = false;
     const policies = [root('amy', 'amy-key', 'recommend', 'r_rec')];
     await withGateway({
       attemptsLog: logPath,
       policies,
-      handler: (who, _req, res) => {
-        if (who === 'qa' && qaSpent) { revoke?.(); return spent(res); }
-        ok(res);
-      },
-    }, async ({ send, config }) => {
+      routes: [{ name: 'ten', clients: ['amy'], accounts: names }],
+      accounts: names.map(oauth),
+      handler: (who, _req, res) => (allSpent && who !== 'c9' ? spent(res) : ok(res)),
+    }, async ({ send, seen }) => {
       assert.equal((await send()).status, 200);
-      qaSpent = true;
-      const orig = config.proxy.clientKeys;
-      revoke = () => { revoke = null; config.proxy.clientKeys = []; };
+      allSpent = true;
       const offered = await send();
-      config.proxy.clientKeys = orig;
-      assert.equal(offered.status, 429, 'the refused continuation discloses the offer, nothing sent to a sibling');
+      assert.equal(offered.status, 429, 'the capped continuation discloses the offer');
       assert.match(offered.json?.error?.message ?? '', /next prompt confirms/);
-      assert.equal(readEvents(logPath).length, 0, 'the disclosed offer writes no event');
+      const hops = readEvents(logPath);
+      assert.deepEqual(hops.map((e) => [e.mode, e.hop]), [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ['recommend', n]),
+        'the 8 automatic hops write one event each, the disclosed offer none');
       assert.equal((await send()).status, 200, 'the next prompt confirms and takes the offer');
-      const events = readEvents(logPath);
+      assert.deepEqual(seen.slice(-1), ['c9']);
+      const events = readEvents(logPath).slice(hops.length);
       assert.equal(events.length, 1);
       const ev = events[0];
       assert.deepEqual(Object.keys(ev), T1_KEYS);
       assert.equal(ev.mode, 'recommend');
       assert.equal(ev.hop, 1);
-      assert.equal(ev.from, 'qa');
-      assert.equal(ev.to, 'qb');
+      assert.equal(ev.from, 'c8');
+      assert.equal(ev.to, 'c9');
       assert.equal(ev.source, 'root');
       assert.equal(ev.revision, 'r_rec');
       assert.equal(ev.keyRef, offerKeyRef(keyHashOf('amy-key')));
@@ -601,7 +602,7 @@ test('NO_EVENT: initial 429, no sibling, key revoked mid-request, and a pre-send
   try {
     const logPath = join(dir, 'attempts.jsonl');
     // (1) recommend root with the key revoked mid-request: the continuation
-    // is refused and the 429 only records an offer.
+    // is refused with the key-revoked stop, as under force.
     let qaSpent = false;
     let revokeRec = null;
     const recommend = [root('amy', 'amy-key', 'recommend', 'r_rec')];
@@ -618,8 +619,10 @@ test('NO_EVENT: initial 429, no sibling, key revoked mid-request, and a pre-send
       const orig = config.proxy.clientKeys;
       revokeRec = () => { revokeRec = null; config.proxy.clientKeys = []; };
       try {
-        assert.equal((await send()).status, 429);
-        assert.equal(readEvents(logPath).length, 0, 'the initial 429 and the recorded offer write nothing');
+        const r = await send();
+        assert.equal(r.status, 429);
+        assert.match(r.json?.error?.message ?? '', /revoked or rotated/);
+        assert.equal(readEvents(logPath).length, 0, 'the initial 429 and the key-revoked stop write nothing');
       } finally {
         config.proxy.clientKeys = orig;
       }

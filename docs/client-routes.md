@@ -47,10 +47,11 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
 
   If the destination also spends out, the hop moves on again, under the destination's policy. A
   single-account route, or one whose other accounts are all spent, has nowhere to move, so both
-  modes retain the hard stop. When a `recommend` hop is refused (the hop cap is reached, or the key
-  was revoked mid-request) the answer is the continuation offer: it warns that continuing will
-  reprocess the full context with a cold prompt cache and offers a new conversation or waiting
-  for the reset, and a later prompt in that same conversation confirms the switch once.
+  modes retain the hard stop. A key revoked mid-request stops the request under both policies.
+  When a `recommend` hop is refused by the hop cap, the answer is the continuation offer: it warns
+  that continuing will reprocess the full context with a cold prompt cache and offers a new
+  conversation or waiting for the reset, and a later prompt in that same conversation confirms the
+  switch once. Under `force` the cap is a stop.
 
   `cg` sends the choices as `x-teamclaude-seat-policy: *=recommend,s1=recommend,s2=force`. The
   renderer emits route slugs and accounts in the same order, so `s1+s2` maps those slugs to the two
@@ -120,15 +121,18 @@ captures `{ mode, revision }` once at admission; that snapshot governs all its r
 - Automatic continuation, force or recommend, is capped at **8 automatic continuations (hops) per
   request** — 9 upstream attempts counting the first. Before every hop the presented key is
   re-checked against the current client keys (a key revoked or rotated by a reload mid-request).
-  Under `force`, the next would-be hop past the cap, or a revoked key, ends the request with a
-  non-unified 429 with `x-should-retry: false`. Under `recommend`, either answers with the
-  continuation offer, as before AI-2049.
+  A revoked key ends the request with a non-unified 429 with `x-should-retry: false` under both
+  policies, and records no offer: a revoked key could never take one. The next would-be hop past
+  the cap ends the request with the same 429 under `force`, and answers with the continuation
+  offer under `recommend`.
 - The actionable multi-seat 429 (a pinned conversation whose seat has a servable sibling) appends
-  the owner-wide `cg seat-policy` paragraph (both policies continue on their own; `recommend`
-  suggests a handoff first, `force` never does) only when the request carries
+  the owner-wide `cg seat-policy` paragraph only when the request carries
   `x-teamclaude-cg-contract: root-v1` — older cg builds answer that command with a usage error on
-  multi-seat keys. Single-seat and no-candidate variants never carry it. The header is stripped
-  before any upstream on every path.
+  multi-seat keys. Under AI-2049 that 429 answers a `recommend` request whose automatic
+  continuations reached the hop cap, so the paragraph says so, then what each policy does: both
+  continue on their own while an account can serve and the limit allows, `recommend` also
+  suggests a handoff before the pinned account runs out, and `force` never does. Single-seat and
+  no-candidate variants never carry it. The header is stripped before any upstream on every path.
 
 `POST /teamclaude/reload` applies both keys with no restart, in the same step as `proxy.clientKeys`.
 A request keeps the binding it read at admission for all its retries.
@@ -176,7 +180,7 @@ When the seat cannot serve, the answer always comes from the seat itself:
 | Seat state | Answer |
 |---|---|
 | Spent: upstream sent a 429 rejecting a quota window, and that window's reset is still ahead | 429 with upstream's own `anthropic-ratelimit-unified-*` headers and `x-should-retry: false`. The 429 that reports the spend gets this answer at once. Later requests get it with nothing sent upstream. A `7d_oi` rejection covers Fable requests only. |
-| Spent pinned account in a multi-account route, with a servable sibling | `recommend` and `force` alike: the same request retries immediately on the sibling with its body unchanged, with a cold cache and `x-teamclaude-seat-failover`. When a `recommend` hop is refused (hop cap reached, key revoked mid-request), the response is an actionable 429 offer with `x-should-retry: false` and no unified headers, so Claude Code shows the choices (continue cold, start a new conversation, or wait for the reset) instead of its generic plan-limit banner. It does not recommend `/ipm:handoff`: after the limit, running one is itself the prompt that confirms the cold continuation. Its message names the currently servable sibling first, then gives the reset blocking the pinned account for this request, so the reset does not read as a key-wide outage; the destination is selected again when the next request arrives. The next prompt confirms and switches once. A refused `force` hop ends with a non-unified 429 (see [owner-root continuation policies](#owner-root-continuation-policies-ai-1903)). |
+| Spent pinned account in a multi-account route, with a servable sibling | `recommend` and `force` alike: the same request retries immediately on the sibling with its body unchanged, with a cold cache and `x-teamclaude-seat-failover`. When a `recommend` hop is refused by the hop cap, the response is an actionable 429 offer with `x-should-retry: false` and no unified headers, so Claude Code shows the choices (continue cold, start a new conversation, or wait for the reset) instead of its generic plan-limit banner. It does not recommend `/ipm:handoff`: after the limit, running one is itself the prompt that confirms the cold continuation. Its message names the currently servable sibling first, then gives the reset blocking the pinned account for this request, so the reset does not read as a key-wide outage; the destination is selected again when the next request arrives. The next prompt confirms and switches once. A `force` hop refused by the cap, and a hop of either policy refused because the key was revoked mid-request, end with a non-unified 429 (see [owner-root continuation policies](#owner-root-continuation-policies-ai-1903)). |
 | Pinned account in a multi-account route near a quota window, still serving, `recommend`, with a servable sibling | Once per conversation per cooldown, for a large request: an actionable 429 recommending `/ipm:handoff` now (`handoffBeforeSwitch`, below). Nothing is sent upstream; the next prompt is served by the pinned account. |
 | Throttled (rate-limit hold) | 429 with `retry-after`. It stays retryable. |
 | Operator budget cap (`maxUsage`, `maxSpend`) | 429 with `x-should-retry: false`. No unified headers are made up. |
@@ -210,8 +214,9 @@ advance behavior.
 `handoffBeforeSwitch` (on by default) recommends `/ipm:handoff` while it can still help. After the
 pinned account is spent, the conversation has already continued on another account with a cold
 cache. Before the limit, the pinned account summarizes the conversation from its warm cache, and
-the new conversation starts small. This ask is the only difference between `recommend` and
-`force`.
+the new conversation starts small. While a hop can run, this ask is the only difference between
+`recommend` and `force`. When a hop is refused by the per-request hop cap, `recommend` answers with
+the continuation offer and `force` with a stop.
 
 A request is answered with the ask only when all of these hold: it is a `POST /v1/messages`
 completion bound to a seat with two or more accounts, with a client session, no explicit
